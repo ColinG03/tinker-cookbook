@@ -46,6 +46,61 @@ from tinker_cookbook.utils.trace import scope, update_scope_context, trace_init
 logger = logging.getLogger(__name__)
 
 
+def identify_reasoning_tokens(
+    model_input: tinker.ModelInput,
+    tokenizer: Tokenizer,
+) -> torch.Tensor:
+    """
+    Identify tokens that are between <think> and </think> markers.
+    
+    Args:
+        model_input: The ModelInput containing the sequence
+        tokenizer: Tokenizer to encode the markers
+        
+    Returns:
+        A boolean tensor of shape (seq_len,) where True indicates reasoning tokens
+    """
+    # Get all tokens from the model input
+    tokens = model_input.to_ints()
+    
+    # Encode the markers as token sequences
+    think_start_tokens = tokenizer.encode("<think>", add_special_tokens=False)
+    think_end_tokens = tokenizer.encode("</think>", add_special_tokens=False)
+    
+    # Find all occurrences of <think> and </think> in the token sequence
+    reasoning_mask = torch.zeros(len(tokens), dtype=torch.bool)
+    
+    i = 0
+    while i < len(tokens):
+        # Look for <think> marker
+        if i + len(think_start_tokens) <= len(tokens):
+            if tokens[i:i + len(think_start_tokens)] == think_start_tokens:
+                # Found <think>, now look for </think>
+                j = i + len(think_start_tokens)
+                found_end = False
+                while j < len(tokens):
+                    if j + len(think_end_tokens) <= len(tokens):
+                        if tokens[j:j + len(think_end_tokens)] == think_end_tokens:
+                            # Found </think>, mark all tokens from <think> to </think> inclusive
+                            reasoning_mask[i:j + len(think_end_tokens)] = True
+                            i = j + len(think_end_tokens)
+                            found_end = True
+                            break
+                    j += 1
+                
+                if not found_end:
+                    # No closing tag found, mark from <think> to end and stop searching
+                    reasoning_mask[i:] = True
+                    break
+                # If found_end is True, continue searching from the new i position
+            else:
+                i += 1
+        else:
+            i += 1
+    
+    return reasoning_mask
+
+
 @scope
 async def incorporate_kl_penalty(
     data_D: List[tinker.Datum],
@@ -53,10 +108,16 @@ async def incorporate_kl_penalty(
     dataset_indices_D: List[int],
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    tokenizer: Tokenizer,
+    sample_start_index: int = 0,
 ) -> Dict[str, float]:
     """
     Compute reverse KL between the student (log p) and the teacher model (log q), computed as
     log p - log q. We then adjust the advantages in-place as the negative reverse KL.
+    
+    Reasoning tokens (between <think> and </think>) have reduced KL penalty:
+    - First 500 samples: multiplier 0.0 (no penalty)
+    - Remaining samples: multiplier 0.3
 
     Args:
         data_D: List of datums to compute KL for
@@ -64,6 +125,8 @@ async def incorporate_kl_penalty(
         dataset_indices_D: List of dataset indices, one per datum
         kl_penalty_coef: Coefficient for KL penalty
         kl_discount_factor: Discount factor for future KL
+        tokenizer: Tokenizer to identify reasoning tokens
+        sample_start_index: Starting index for sample counting (for multiplier selection)
     """
     # Note: if your teacher has a different renderer than the student, you may want to modify
     #       the full_sequence_inputs_D to match the teacher's renderer.
@@ -95,8 +158,68 @@ async def incorporate_kl_penalty(
     per_dataset_kl: Dict[int, tuple[float, float]] = {}
 
     for i, datum in enumerate(data_D):
+        sample_index = sample_start_index + i
+        
+        # Identify reasoning tokens (between <think> and </think>) from the full sequence
+        # full_sequence_inputs_D[i] contains input + last target token
+        reasoning_mask_full = identify_reasoning_tokens(full_sequence_inputs_D[i], tokenizer)
+        
+        # Determine multiplier for reasoning tokens based on sample index
+        # First 500 samples: 0.0, remaining: 0.3
+        reasoning_multiplier = 0.0 if sample_index < 500 else 0.3
+        
+        # The reverse_kl is computed for target tokens (teacher_logprobs[1:])
+        # So we need to extract the reasoning mask for target positions (indices 1 onwards)
+        seq_len = len(reverse_kl[i])
+        
+        # Validate sequence length relationships with graceful fallback
+        expected_full_length = len(full_sequence_inputs_D[i].to_ints())
+        actual_mask_length = len(reasoning_mask_full)
+        expected_target_length = expected_full_length - 1
+        
+        # Check if reasoning mask length matches full sequence length
+        if actual_mask_length != expected_full_length:
+            logger.warning(
+                f"Reasoning mask length mismatch for datum {i} (sample {sample_index}): "
+                f"expected {expected_full_length} (from full_sequence), "
+                f"got {actual_mask_length} (from identify_reasoning_tokens). "
+                f"Skipping reasoning token scaling for this datum."
+            )
+            # Fallback: use uniform multiplier (no reasoning token scaling)
+            kl_multiplier = torch.ones(seq_len)
+        # Check if reverse_kl length matches expected target length
+        elif seq_len != expected_target_length:
+            logger.warning(
+                f"Reverse KL length mismatch for datum {i} (sample {sample_index}): "
+                f"expected {expected_target_length} (full_sequence - 1), "
+                f"got {seq_len} (from reverse_kl). "
+                f"Skipping reasoning token scaling for this datum."
+            )
+            # Fallback: use uniform multiplier (no reasoning token scaling)
+            kl_multiplier = torch.ones(seq_len)
+        else:
+            # Extract reasoning mask for target positions
+            reasoning_mask_target = reasoning_mask_full[1:seq_len + 1]
+            
+            # Final check: verify the slice worked correctly
+            if len(reasoning_mask_target) != seq_len:
+                logger.warning(
+                    f"Reasoning mask target length mismatch for datum {i} (sample {sample_index}): "
+                    f"expected {seq_len}, got {len(reasoning_mask_target)}. "
+                    f"reasoning_mask_full length: {len(reasoning_mask_full)}, "
+                    f"seq_len: {seq_len}. "
+                    f"Skipping reasoning token scaling for this datum."
+                )
+                # Fallback: use uniform multiplier (no reasoning token scaling)
+                kl_multiplier = torch.ones(seq_len)
+            else:
+                # All checks passed - apply reasoning token scaling
+                kl_multiplier = torch.ones(seq_len)
+                kl_multiplier[reasoning_mask_target] = reasoning_multiplier
+        
         # The advantage is the negative reverse KL. We can optionally apply a discount factor.
-        kl_advantages = -kl_penalty_coef * float_masks[i] * reverse_kl[i]
+        # Apply the multiplier to the KL penalty coefficient for reasoning tokens
+        kl_advantages = -kl_penalty_coef * float_masks[i] * reverse_kl[i] * kl_multiplier
         if kl_discount_factor > 0:
             kl_advantages = torch.tensor(
                 discounted_future_sum_vectorized(kl_advantages.numpy(), kl_discount_factor)
@@ -172,7 +295,8 @@ async def prepare_minibatch(
     teacher_clients: List[tinker.SamplingClient],
     kl_penalty_coef: float,
     kl_discount_factor: float,
-) -> tuple[list[tinker.Datum], dict[str, Any]]:
+    sample_start_index: int = 0,
+) -> tuple[list[tinker.Datum], dict[str, Any], int]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
     # Compute trajectory metrics
@@ -212,10 +336,12 @@ async def prepare_minibatch(
                 dataset_indices_D,
                 kl_penalty_coef,
                 kl_discount_factor,
+                tokenizer,
+                sample_start_index,
             )
         metrics.update(kl_penalty_metrics)
 
-    return data_D, metrics
+    return data_D, metrics, len(data_D)
 
 
 @scope
@@ -229,11 +355,12 @@ async def do_train_step_and_get_sampling_client(
     trajectory_groups_P: list[TrajectoryGroup],
     dataset_indices_P: List[int],
     teacher_clients: List[tinker.SamplingClient],
-) -> tuple[tinker.SamplingClient, dict[str, Any]]:
+    sample_start_index: int = 0,
+) -> tuple[tinker.SamplingClient, dict[str, Any], int]:
     update_scope_context({"step": i_batch})
 
     metrics = {}
-    data_D, prepare_minibatch_metrics = await prepare_minibatch(
+    data_D, prepare_minibatch_metrics, num_samples = await prepare_minibatch(
         env_group_builders_P,
         trajectory_groups_P,
         tokenizer,
@@ -241,6 +368,7 @@ async def do_train_step_and_get_sampling_client(
         teacher_clients,
         kl_penalty_coef=cfg.kl_penalty_coef,
         kl_discount_factor=cfg.kl_discount_factor,
+        sample_start_index=sample_start_index,
     )
     metrics.update(prepare_minibatch_metrics)
 
@@ -267,7 +395,7 @@ async def do_train_step_and_get_sampling_client(
     )
     metrics.update(full_batch_metrics)
 
-    return sampling_client, metrics
+    return sampling_client, metrics, num_samples
 
 
 @scope
@@ -290,6 +418,9 @@ async def do_sync_training(
     sampling_client, _ = await save_checkpoint_and_get_sampling_client(
         training_client, start_batch, cfg.log_path, cfg.save_every
     )
+
+    # Track total number of samples processed across all batches
+    total_samples_processed = 0
 
     for i_batch in range(start_batch, end_batch):
         metrics = {
@@ -331,7 +462,7 @@ async def do_sync_training(
         ]
 
         # Train step
-        sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
+        sampling_client, train_step_metrics, num_samples = await do_train_step_and_get_sampling_client(
             cfg,
             i_batch,
             training_client,
@@ -341,7 +472,9 @@ async def do_sync_training(
             trajectory_groups_P,
             dataset_indices_P,
             teacher_clients,
+            sample_start_index=total_samples_processed,
         )
+        total_samples_processed += num_samples
 
         # Log metrics
         metrics.update(train_step_metrics)
