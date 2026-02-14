@@ -116,7 +116,7 @@ async def incorporate_kl_penalty(
     log p - log q. We then adjust the advantages in-place as the negative reverse KL.
     
     Reasoning tokens (between <think> and </think>) have adjustable KL penalty:
-    - Multiplier 1.0 (reduce to down-weight think token KL)
+    - Multiplier 0.3 (reduce to down-weight think token KL)
 
     Args:
         data_D: List of datums to compute KL for
@@ -164,7 +164,7 @@ async def incorporate_kl_penalty(
         reasoning_mask_full = identify_reasoning_tokens(full_sequence_inputs_D[i], tokenizer)
         
         # Determine multiplier for reasoning tokens (reduce below 1.0 to down-weight think token KL)
-        reasoning_multiplier = 1.0
+        reasoning_multiplier = 0.3
         
         # The reverse_kl is computed for target tokens (teacher_logprobs[1:])
         # So we need to extract the reasoning mask for target positions (indices 1 onwards)
