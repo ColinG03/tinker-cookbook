@@ -51,48 +51,43 @@ def identify_reasoning_tokens(
     tokenizer: Tokenizer,
 ) -> torch.Tensor:
     """
-    Identify tokens that are between <think> and </think> markers.
+    Identify tokens that are between <think> and </think> markers, excluding the
+    tag tokens themselves (they are structurally integral and should not be down-weighted).
     
     Args:
         model_input: The ModelInput containing the sequence
         tokenizer: Tokenizer to encode the markers
         
     Returns:
-        A boolean tensor of shape (seq_len,) where True indicates reasoning tokens
+        A boolean tensor of shape (seq_len,) where True indicates reasoning content tokens
     """
-    # Get all tokens from the model input
     tokens = model_input.to_ints()
     
-    # Encode the markers as token sequences
     think_start_tokens = tokenizer.encode("<think>", add_special_tokens=False)
     think_end_tokens = tokenizer.encode("</think>", add_special_tokens=False)
     
-    # Find all occurrences of <think> and </think> in the token sequence
     reasoning_mask = torch.zeros(len(tokens), dtype=torch.bool)
     
     i = 0
     while i < len(tokens):
-        # Look for <think> marker
         if i + len(think_start_tokens) <= len(tokens):
             if tokens[i:i + len(think_start_tokens)] == think_start_tokens:
-                # Found <think>, now look for </think>
-                j = i + len(think_start_tokens)
+                content_start = i + len(think_start_tokens)
+                j = content_start
                 found_end = False
                 while j < len(tokens):
                     if j + len(think_end_tokens) <= len(tokens):
                         if tokens[j:j + len(think_end_tokens)] == think_end_tokens:
-                            # Found </think>, mark all tokens from <think> to </think> inclusive
-                            reasoning_mask[i:j + len(think_end_tokens)] = True
+                            # Mark only the content between tags, not the tags themselves
+                            reasoning_mask[content_start:j] = True
                             i = j + len(think_end_tokens)
                             found_end = True
                             break
                     j += 1
                 
                 if not found_end:
-                    # No closing tag found, mark from <think> to end and stop searching
-                    reasoning_mask[i:] = True
+                    reasoning_mask[content_start:] = True
                     break
-                # If found_end is True, continue searching from the new i position
             else:
                 i += 1
         else:
@@ -108,6 +103,7 @@ async def incorporate_kl_penalty(
     dataset_indices_D: List[int],
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    reasoning_kl_multiplier: float,
     tokenizer: Tokenizer,
     sample_start_index: int = 0,
 ) -> Dict[str, float]:
@@ -115,8 +111,8 @@ async def incorporate_kl_penalty(
     Compute reverse KL between the student (log p) and the teacher model (log q), computed as
     log p - log q. We then adjust the advantages in-place as the negative reverse KL.
     
-    Reasoning tokens (between <think> and </think>) have adjustable KL penalty:
-    - Multiplier 0.3 (reduce to down-weight think token KL)
+    Reasoning tokens (between <think> and </think>) have their KL penalty scaled by
+    reasoning_kl_multiplier (1.0 = full penalty, 0.0 = no penalty).
 
     Args:
         data_D: List of datums to compute KL for
@@ -124,8 +120,9 @@ async def incorporate_kl_penalty(
         dataset_indices_D: List of dataset indices, one per datum
         kl_penalty_coef: Coefficient for KL penalty
         kl_discount_factor: Discount factor for future KL
+        reasoning_kl_multiplier: Multiplier for KL penalty on think tokens (1.0 = no reduction)
         tokenizer: Tokenizer to identify reasoning tokens
-        sample_start_index: Starting index for sample counting (for multiplier selection)
+        sample_start_index: Starting index for sample counting
     """
     # Note: if your teacher has a different renderer than the student, you may want to modify
     #       the full_sequence_inputs_D to match the teacher's renderer.
@@ -163,8 +160,7 @@ async def incorporate_kl_penalty(
         # full_sequence_inputs_D[i] contains input + last target token
         reasoning_mask_full = identify_reasoning_tokens(full_sequence_inputs_D[i], tokenizer)
         
-        # Determine multiplier for reasoning tokens (reduce below 1.0 to down-weight think token KL)
-        reasoning_multiplier = 0.3
+        reasoning_multiplier = reasoning_kl_multiplier
         
         # The reverse_kl is computed for target tokens (teacher_logprobs[1:])
         # So we need to extract the reasoning mask for target positions (indices 1 onwards)
@@ -262,6 +258,7 @@ class Config:
 
     kl_penalty_coef: float = 1.0
     kl_discount_factor: float = 0.0
+    reasoning_kl_multiplier: float = 1.0
 
     # Loss function and configuration.
     # See https://tinker-docs.thinkingmachines.ai/losses
@@ -293,6 +290,7 @@ async def prepare_minibatch(
     teacher_clients: List[tinker.SamplingClient],
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    reasoning_kl_multiplier: float,
     sample_start_index: int = 0,
 ) -> tuple[list[tinker.Datum], dict[str, Any], int]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
@@ -334,6 +332,7 @@ async def prepare_minibatch(
                 dataset_indices_D,
                 kl_penalty_coef,
                 kl_discount_factor,
+                reasoning_kl_multiplier,
                 tokenizer,
                 sample_start_index,
             )
@@ -366,6 +365,7 @@ async def do_train_step_and_get_sampling_client(
         teacher_clients,
         kl_penalty_coef=cfg.kl_penalty_coef,
         kl_discount_factor=cfg.kl_discount_factor,
+        reasoning_kl_multiplier=cfg.reasoning_kl_multiplier,
         sample_start_index=sample_start_index,
     )
     metrics.update(prepare_minibatch_metrics)
