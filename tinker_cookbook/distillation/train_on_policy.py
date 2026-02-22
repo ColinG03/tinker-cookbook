@@ -51,15 +51,16 @@ def identify_reasoning_tokens(
     tokenizer: Tokenizer,
 ) -> torch.Tensor:
     """
-    Identify tokens that are between <think> and </think> markers, excluding the
-    tag tokens themselves (they are structurally integral and should not be down-weighted).
+    Identify tokens that are part of reasoning blocks, from the start of <think> through
+    the end of </think> inclusive. When no closing </think> is found, marks from <think>
+    through the end of the sequence.
     
     Args:
         model_input: The ModelInput containing the sequence
         tokenizer: Tokenizer to encode the markers
         
     Returns:
-        A boolean tensor of shape (seq_len,) where True indicates reasoning content tokens
+        A boolean tensor of shape (seq_len,) where True indicates reasoning tokens
     """
     tokens = model_input.to_ints()
     
@@ -72,21 +73,20 @@ def identify_reasoning_tokens(
     while i < len(tokens):
         if i + len(think_start_tokens) <= len(tokens):
             if tokens[i:i + len(think_start_tokens)] == think_start_tokens:
-                content_start = i + len(think_start_tokens)
-                j = content_start
+                block_start = i
+                j = i + len(think_start_tokens)
                 found_end = False
                 while j < len(tokens):
                     if j + len(think_end_tokens) <= len(tokens):
                         if tokens[j:j + len(think_end_tokens)] == think_end_tokens:
-                            # Mark only the content between tags, not the tags themselves
-                            reasoning_mask[content_start:j] = True
+                            reasoning_mask[block_start:j + len(think_end_tokens)] = True
                             i = j + len(think_end_tokens)
                             found_end = True
                             break
                     j += 1
                 
                 if not found_end:
-                    reasoning_mask[content_start:] = True
+                    reasoning_mask[block_start:] = True
                     break
             else:
                 i += 1
@@ -111,8 +111,8 @@ async def incorporate_kl_penalty(
     Compute reverse KL between the student (log p) and the teacher model (log q), computed as
     log p - log q. We then adjust the advantages in-place as the negative reverse KL.
     
-    Reasoning tokens (between <think> and </think>) have their KL penalty scaled by
-    reasoning_kl_multiplier (1.0 = full penalty, 0.0 = no penalty).
+    Reasoning tokens (from <think> through </think>, inclusive of the tags) have their
+    KL penalty scaled by reasoning_kl_multiplier (1.0 = full penalty, 0.0 = no penalty).
 
     Args:
         data_D: List of datums to compute KL for
