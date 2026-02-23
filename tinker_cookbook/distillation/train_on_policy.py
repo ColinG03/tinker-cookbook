@@ -46,6 +46,41 @@ from tinker_cookbook.utils.trace import scope, update_scope_context, trace_init
 logger = logging.getLogger(__name__)
 
 
+def check_think_tag_format(
+    model_input: tinker.ModelInput,
+    tokenizer: Tokenizer,
+) -> bool:
+    """
+    Check whether think tags in the token sequence are well-formed.
+    Returns True when every <think> has a matching </think> (and at least one
+    pair exists). Returns False when tags are missing entirely or unbalanced.
+    """
+    tokens = model_input.to_ints()
+    think_start_tokens = tokenizer.encode("<think>", add_special_tokens=False)
+    think_end_tokens = tokenizer.encode("</think>", add_special_tokens=False)
+
+    n_open = 0
+    n_close = 0
+    i = 0
+    while i < len(tokens):
+        if (
+            i + len(think_start_tokens) <= len(tokens)
+            and tokens[i : i + len(think_start_tokens)] == think_start_tokens
+        ):
+            n_open += 1
+            i += len(think_start_tokens)
+        elif (
+            i + len(think_end_tokens) <= len(tokens)
+            and tokens[i : i + len(think_end_tokens)] == think_end_tokens
+        ):
+            n_close += 1
+            i += len(think_end_tokens)
+        else:
+            i += 1
+
+    return n_open > 0 and n_open == n_close
+
+
 def identify_reasoning_tokens(
     model_input: tinker.ModelInput,
     tokenizer: Tokenizer,
@@ -106,6 +141,7 @@ async def incorporate_kl_penalty(
     reasoning_kl_multiplier: float,
     tokenizer: Tokenizer,
     sample_start_index: int = 0,
+    format_penalty: float = 0.0,
 ) -> Dict[str, float]:
     """
     Compute reverse KL between the student (log p) and the teacher model (log q), computed as
@@ -123,6 +159,7 @@ async def incorporate_kl_penalty(
         reasoning_kl_multiplier: Multiplier for KL penalty on think tokens (1.0 = no reduction)
         tokenizer: Tokenizer to identify reasoning tokens
         sample_start_index: Starting index for sample counting
+        format_penalty: Penalty applied to advantages when think tags are malformed/missing
     """
     # Note: if your teacher has a different renderer than the student, you may want to modify
     #       the full_sequence_inputs_D to match the teacher's renderer.
@@ -151,7 +188,7 @@ async def incorporate_kl_penalty(
     ]
     # Track per-dataset KL for logging
     # dataset_idx -> (sum of KL, sum of mask)
-    per_dataset_kl: Dict[int, tuple[float, float]] = {}
+    per_dataset_kl: Dict[int | str, tuple[float, float]] = {}
 
     for i, datum in enumerate(data_D):
         sample_index = sample_start_index + i
@@ -222,6 +259,22 @@ async def incorporate_kl_penalty(
             datum.loss_fn_inputs["advantages"].to_torch() + kl_advantages
         )
 
+        # Format penalty: penalize malformed/missing think tags
+        if format_penalty > 0:
+            tags_ok = check_think_tag_format(full_sequence_inputs_D[i], tokenizer)
+            if not tags_ok:
+                format_advantages = -format_penalty * float_masks[i]
+                datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
+                    datum.loss_fn_inputs["advantages"].to_torch() + format_advantages
+                )
+            if "__format_violations" not in per_dataset_kl:
+                per_dataset_kl["__format_violations"] = (0.0, 0.0)
+            prev_v, prev_t = per_dataset_kl["__format_violations"]
+            per_dataset_kl["__format_violations"] = (
+                prev_v + (0.0 if tags_ok else 1.0),
+                prev_t + 1.0,
+            )
+
         # Accumulate per-dataset KL
         dataset_idx = dataset_indices_D[i]
         kl_sum = reverse_kl[i].sum().item()
@@ -242,6 +295,10 @@ async def incorporate_kl_penalty(
         if mask_sum > 0:
             metrics[f"teacher_kl/dataset_{dataset_idx}"] = float(kl_sum / mask_sum)
 
+    if "__format_violations" in per_dataset_kl:
+        v, t = per_dataset_kl.pop("__format_violations")
+        metrics["think_tag_violation_rate"] = float(v / t) if t > 0 else 0.0
+
     return metrics
 
 
@@ -259,6 +316,7 @@ class Config:
     kl_penalty_coef: float = 1.0
     kl_discount_factor: float = 0.0
     reasoning_kl_multiplier: float = 1.0
+    format_penalty: float = 0.0
 
     # Loss function and configuration.
     # See https://tinker-docs.thinkingmachines.ai/losses
@@ -292,6 +350,7 @@ async def prepare_minibatch(
     kl_discount_factor: float,
     reasoning_kl_multiplier: float,
     sample_start_index: int = 0,
+    format_penalty: float = 0.0,
 ) -> tuple[list[tinker.Datum], dict[str, Any], int]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
@@ -335,6 +394,7 @@ async def prepare_minibatch(
                 reasoning_kl_multiplier,
                 tokenizer,
                 sample_start_index,
+                format_penalty=format_penalty,
             )
         metrics.update(kl_penalty_metrics)
 
@@ -367,6 +427,7 @@ async def do_train_step_and_get_sampling_client(
         kl_discount_factor=cfg.kl_discount_factor,
         reasoning_kl_multiplier=cfg.reasoning_kl_multiplier,
         sample_start_index=sample_start_index,
+        format_penalty=cfg.format_penalty,
     )
     metrics.update(prepare_minibatch_metrics)
 
