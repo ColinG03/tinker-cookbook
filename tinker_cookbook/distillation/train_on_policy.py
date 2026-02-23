@@ -317,6 +317,8 @@ class Config:
     kl_discount_factor: float = 0.0
     reasoning_kl_multiplier: float = 1.0
     format_penalty: float = 0.0
+    format_violation_threshold: float = 0.5
+    format_violation_patience: int = 3
 
     # Loss function and configuration.
     # See https://tinker-docs.thinkingmachines.ai/losses
@@ -480,6 +482,7 @@ async def do_sync_training(
 
     # Track total number of samples processed across all batches
     total_samples_processed = 0
+    consecutive_violations = 0
 
     for i_batch in range(start_batch, end_batch):
         metrics = {
@@ -539,6 +542,24 @@ async def do_sync_training(
         metrics.update(train_step_metrics)
         metrics["time/total"] = time.time() - t_start
         ml_logger.log_metrics(metrics, step=i_batch)
+
+        # Early stopping on sustained think-tag violations
+        if cfg.format_violation_threshold < 1.0:
+            violation_rate = metrics.get("think_tag_violation_rate", 0.0)
+            if violation_rate > cfg.format_violation_threshold:
+                consecutive_violations += 1
+                logger.warning(
+                    f"think_tag_violation_rate={violation_rate:.2f} > {cfg.format_violation_threshold} "
+                    f"({consecutive_violations}/{cfg.format_violation_patience})"
+                )
+                if consecutive_violations >= cfg.format_violation_patience:
+                    logger.error(
+                        f"Early stopping: violation rate exceeded threshold for "
+                        f"{consecutive_violations} consecutive batches"
+                    )
+                    break
+            else:
+                consecutive_violations = 0
 
 
 @scope
