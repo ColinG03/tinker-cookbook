@@ -289,14 +289,17 @@ async def incorporate_kl_penalty(
         [mask.sum() for mask in float_masks]
     )
 
+    # Extract format violation stats before iterating per-dataset KL
+    format_violations = per_dataset_kl.pop("__format_violations", None)
+
     # Compute per-dataset metrics
     metrics = {"teacher_kl": float(avg_logp_diff)}
     for dataset_idx, (kl_sum, mask_sum) in per_dataset_kl.items():
         if mask_sum > 0:
             metrics[f"teacher_kl/dataset_{dataset_idx}"] = float(kl_sum / mask_sum)
 
-    if "__format_violations" in per_dataset_kl:
-        v, t = per_dataset_kl.pop("__format_violations")
+    if format_violations is not None:
+        v, t = format_violations
         metrics["think_tag_violation_rate"] = float(v / t) if t > 0 else 0.0
 
     return metrics
