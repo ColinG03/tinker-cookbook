@@ -11,6 +11,7 @@ from tinker.types import EncodedTextChunk
 from tinker_cookbook.distillation.train_on_policy import (
     identify_reasoning_tokens,
     incorporate_kl_penalty,
+    swap_system_prompt_tokens,
 )
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
@@ -192,6 +193,7 @@ async def _test_incorporate_kl_penalty_basic_async():
         dataset_indices_D=[0],
         kl_penalty_coef=1.0,
         kl_discount_factor=0.0,
+        reasoning_kl_multiplier=1.0,
         tokenizer=tokenizer,
         sample_start_index=0,  # First sample, so index 0 < 500
     )
@@ -250,6 +252,7 @@ async def _test_incorporate_kl_penalty_reasoning_multiplier_async():
         dataset_indices_D=[0],
         kl_penalty_coef=1.0,
         kl_discount_factor=0.0,
+        reasoning_kl_multiplier=0.3,
         tokenizer=tokenizer,
         sample_start_index=500,  # >= 500, so should use 0.3 multiplier
     )
@@ -313,6 +316,7 @@ async def _test_incorporate_kl_penalty_length_mismatch_handling_async():
             dataset_indices_D=[0],
             kl_penalty_coef=1.0,
             kl_discount_factor=0.0,
+            reasoning_kl_multiplier=1.0,
             tokenizer=tokenizer,
             sample_start_index=0,
         )
@@ -372,6 +376,7 @@ async def _test_incorporate_kl_penalty_multiple_datums_async():
         dataset_indices_D=[0, 0, 0],
         kl_penalty_coef=1.0,
         kl_discount_factor=0.0,
+        reasoning_kl_multiplier=1.0,
         tokenizer=tokenizer,
         sample_start_index=499,  # First sample is 499 (< 500), second is 500 (>= 500)
     )
@@ -389,3 +394,285 @@ async def _test_incorporate_kl_penalty_multiple_datums_async():
 def test_incorporate_kl_penalty_multiple_datums():
     """Wrapper to run async test."""
     asyncio.run(_test_incorporate_kl_penalty_multiple_datums_async())
+
+
+# =============================================================================
+# Tests for swap_system_prompt_tokens
+# =============================================================================
+
+
+def _build_qwen3_sequence(tokenizer, system_prompt: str, user_msg: str, assistant_msg: str) -> list[int]:
+    """Build a Qwen3 chat-template token sequence from raw parts."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
+        {"role": "assistant", "content": assistant_msg},
+    ]
+    return tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+
+
+def test_swap_system_prompt_basic():
+    """Swapping produces a sequence with the new system prompt and preserves the rest."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+    original_sys = "You are a friendly tutor."
+    new_sys = "You are a Socratic tutor who always asks guiding questions."
+
+    tokens = _build_qwen3_sequence(tokenizer, original_sys, "Hi", "Hello!")
+    model_input = tinker.ModelInput.from_ints(tokens)
+
+    swapped = swap_system_prompt_tokens(model_input, tokenizer, new_sys)
+    swapped_text = tokenizer.decode(swapped.to_ints())
+
+    assert new_sys in swapped_text, "New system prompt should appear in the swapped sequence"
+    assert original_sys not in swapped_text, "Original system prompt should be gone"
+    # User and assistant turns must survive
+    assert "Hi" in swapped_text
+    assert "Hello!" in swapped_text
+
+
+def test_swap_system_prompt_preserves_suffix_exactly():
+    """Everything after the system message should be byte-identical."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+    original_sys = "Short prompt."
+    new_sys = "A much longer and more detailed Socratic system prompt with many extra tokens."
+
+    tokens = _build_qwen3_sequence(tokenizer, original_sys, "What is 2+2?", "Let me think...")
+    model_input = tinker.ModelInput.from_ints(tokens)
+
+    # Find where the original system message ends so we can compare the suffix
+    im_end_tokens = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    system_role_tokens = tokenizer.encode("system\n", add_special_tokens=False)
+    im_start_tokens = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+    header_len = len(im_start_tokens) + len(system_role_tokens)
+
+    # Locate end of system message in original
+    header_tokens = im_start_tokens + system_role_tokens
+    sys_start = -1
+    for i in range(len(tokens) - len(header_tokens) + 1):
+        if tokens[i : i + len(header_tokens)] == header_tokens:
+            sys_start = i
+            break
+    assert sys_start >= 0
+
+    sys_end = -1
+    for i in range(sys_start + header_len, len(tokens) - len(im_end_tokens) + 1):
+        if tokens[i : i + len(im_end_tokens)] == im_end_tokens:
+            sys_end = i + len(im_end_tokens)
+            break
+    newline_tokens = tokenizer.encode("\n", add_special_tokens=False)
+    if tokens[sys_end : sys_end + len(newline_tokens)] == newline_tokens:
+        sys_end += len(newline_tokens)
+
+    original_suffix = tokens[sys_end:]
+
+    swapped = swap_system_prompt_tokens(model_input, tokenizer, new_sys)
+    swapped_tokens = swapped.to_ints()
+
+    # The suffix should appear unchanged at the end of the swapped sequence
+    assert swapped_tokens[-len(original_suffix):] == original_suffix, (
+        "Token suffix after the system message must be preserved exactly"
+    )
+
+
+def test_swap_system_prompt_no_system_message_raises():
+    """Raise ValueError when the sequence has no system message."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    # Build a sequence with only a user turn (no system message)
+    plain_text = "Just some plain text without chat template markers"
+    tokens = tokenizer.encode(plain_text, add_special_tokens=False)
+    model_input = tinker.ModelInput.from_ints(tokens)
+
+    with pytest.raises(ValueError, match="Could not find system message start"):
+        swap_system_prompt_tokens(model_input, tokenizer, "new prompt")
+
+
+def test_swap_system_prompt_round_trip():
+    """Swapping back to the original prompt recovers the original token sequence."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+    original_sys = "You are a helpful assistant."
+    tokens = _build_qwen3_sequence(tokenizer, original_sys, "Hello", "Hi there")
+    model_input = tinker.ModelInput.from_ints(tokens)
+
+    swapped = swap_system_prompt_tokens(model_input, tokenizer, "Temporary prompt")
+    restored = swap_system_prompt_tokens(swapped, tokenizer, original_sys)
+
+    assert restored.to_ints() == tokens, "Round-tripping back to original prompt should recover exact tokens"
+
+
+# =============================================================================
+# Tests for incorporate_kl_penalty with teacher_system_prompt
+# =============================================================================
+
+
+def _make_datum_from_qwen3_chat(tokenizer, system_prompt: str, user_msg: str, assistant_msg: str):
+    """Create a (datum, full_sequence_tokens) pair from a Qwen3 chat."""
+    tokens = _build_qwen3_sequence(tokenizer, system_prompt, user_msg, assistant_msg)
+    model_input = tinker.ModelInput.from_ints(tokens[:-1])
+    target_tokens = tokens[1:]
+    datum = tinker.Datum(
+        model_input=model_input,
+        loss_fn_inputs={
+            "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens)),
+            "logprobs": tinker.TensorData.from_torch(torch.randn(len(target_tokens))),
+            "mask": tinker.TensorData.from_torch(torch.ones(len(target_tokens))),
+            "advantages": tinker.TensorData.from_torch(torch.zeros(len(target_tokens))),
+        },
+    )
+    return datum, tokens
+
+
+async def _test_teacher_system_prompt_modifies_teacher_input_async():
+    """When teacher_system_prompt is set, compute_logprobs_async receives a modified input."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+    student_sys = "You are a tutor."
+    teacher_sys = "You are a Socratic tutor who asks guiding questions rather than giving answers."
+
+    datum, tokens = _make_datum_from_qwen3_chat(tokenizer, student_sys, "What is 2+2?", "Think about it.")
+    full_seq = datum.model_input.append_int(tokens[-1])
+
+    teacher_client = MagicMock()
+    teacher_logprobs = torch.randn(len(full_seq.to_ints())).tolist()
+    teacher_client.compute_logprobs_async = AsyncMock(return_value=teacher_logprobs)
+
+    await incorporate_kl_penalty(
+        data_D=[datum],
+        teacher_clients_D=[teacher_client],
+        dataset_indices_D=[0],
+        kl_penalty_coef=1.0,
+        kl_discount_factor=0.0,
+        reasoning_kl_multiplier=1.0,
+        tokenizer=tokenizer,
+        teacher_system_prompt=teacher_sys,
+    )
+
+    # The teacher should have been called with a modified input
+    teacher_client.compute_logprobs_async.assert_called_once()
+    called_input = teacher_client.compute_logprobs_async.call_args[0][0]
+    called_text = tokenizer.decode(called_input.to_ints())
+
+    assert teacher_sys in called_text, "Teacher should see the overridden system prompt"
+    assert student_sys not in called_text, "Teacher should NOT see the student system prompt"
+
+
+def test_teacher_system_prompt_modifies_teacher_input():
+    asyncio.run(_test_teacher_system_prompt_modifies_teacher_input_async())
+
+
+async def _test_teacher_system_prompt_none_is_backward_compatible_async():
+    """When teacher_system_prompt is None, the teacher sees the same input as before."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+    student_sys = "You are a tutor."
+
+    datum, tokens = _make_datum_from_qwen3_chat(tokenizer, student_sys, "Hi", "Hello")
+    full_seq = datum.model_input.append_int(tokens[-1])
+
+    teacher_client = MagicMock()
+    teacher_logprobs = torch.randn(len(full_seq.to_ints())).tolist()
+    teacher_client.compute_logprobs_async = AsyncMock(return_value=teacher_logprobs)
+
+    await incorporate_kl_penalty(
+        data_D=[datum],
+        teacher_clients_D=[teacher_client],
+        dataset_indices_D=[0],
+        kl_penalty_coef=1.0,
+        kl_discount_factor=0.0,
+        reasoning_kl_multiplier=1.0,
+        tokenizer=tokenizer,
+        teacher_system_prompt=None,
+    )
+
+    called_input = teacher_client.compute_logprobs_async.call_args[0][0]
+    assert called_input.to_ints() == full_seq.to_ints(), (
+        "With teacher_system_prompt=None, teacher input must equal the student's full sequence"
+    )
+
+
+def test_teacher_system_prompt_none_is_backward_compatible():
+    asyncio.run(_test_teacher_system_prompt_none_is_backward_compatible_async())
+
+
+async def _test_teacher_system_prompt_does_not_alter_student_data_async():
+    """The student's model_input and advantages base are never modified by the teacher override."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+    student_sys = "You are a tutor."
+    teacher_sys = "You are a very detailed Socratic tutor."
+
+    datum, tokens = _make_datum_from_qwen3_chat(tokenizer, student_sys, "Question?", "Answer.")
+    full_seq = datum.model_input.append_int(tokens[-1])
+
+    # Snapshot the student's model_input tokens before the call
+    student_tokens_before = datum.model_input.to_ints()
+
+    teacher_client = MagicMock()
+    teacher_logprobs = torch.randn(len(full_seq.to_ints())).tolist()
+    teacher_client.compute_logprobs_async = AsyncMock(return_value=teacher_logprobs)
+
+    await incorporate_kl_penalty(
+        data_D=[datum],
+        teacher_clients_D=[teacher_client],
+        dataset_indices_D=[0],
+        kl_penalty_coef=1.0,
+        kl_discount_factor=0.0,
+        reasoning_kl_multiplier=1.0,
+        tokenizer=tokenizer,
+        teacher_system_prompt=teacher_sys,
+    )
+
+    assert datum.model_input.to_ints() == student_tokens_before, (
+        "Student model_input must not be modified by teacher_system_prompt"
+    )
+
+
+def test_teacher_system_prompt_does_not_alter_student_data():
+    asyncio.run(_test_teacher_system_prompt_does_not_alter_student_data_async())
+
+
+async def _test_teacher_system_prompt_fallback_on_missing_system_msg_async():
+    """If the sequence has no system message, falls back gracefully with a warning."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    # Build a sequence without a system message (just user/assistant)
+    messages = [
+        {"role": "user", "content": "Hey"},
+        {"role": "assistant", "content": "Hi"},
+    ]
+    tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+    model_input = tinker.ModelInput.from_ints(tokens[:-1])
+    target_tokens = tokens[1:]
+
+    datum = tinker.Datum(
+        model_input=model_input,
+        loss_fn_inputs={
+            "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens)),
+            "logprobs": tinker.TensorData.from_torch(torch.randn(len(target_tokens))),
+            "mask": tinker.TensorData.from_torch(torch.ones(len(target_tokens))),
+            "advantages": tinker.TensorData.from_torch(torch.zeros(len(target_tokens))),
+        },
+    )
+
+    full_seq = model_input.append_int(tokens[-1])
+    teacher_client = MagicMock()
+    teacher_logprobs = torch.randn(len(full_seq.to_ints())).tolist()
+    teacher_client.compute_logprobs_async = AsyncMock(return_value=teacher_logprobs)
+
+    # Should not raise — falls back to original
+    metrics = await incorporate_kl_penalty(
+        data_D=[datum],
+        teacher_clients_D=[teacher_client],
+        dataset_indices_D=[0],
+        kl_penalty_coef=1.0,
+        kl_discount_factor=0.0,
+        reasoning_kl_multiplier=1.0,
+        tokenizer=tokenizer,
+        teacher_system_prompt="This should trigger fallback",
+    )
+
+    assert "teacher_kl" in metrics
+    # Verify the teacher was called with the original (unmodified) input
+    called_input = teacher_client.compute_logprobs_async.call_args[0][0]
+    assert called_input.to_ints() == full_seq.to_ints()
+
+
+def test_teacher_system_prompt_fallback_on_missing_system_msg():
+    asyncio.run(_test_teacher_system_prompt_fallback_on_missing_system_msg_async())

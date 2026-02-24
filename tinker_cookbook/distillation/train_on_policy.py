@@ -131,6 +131,65 @@ def identify_reasoning_tokens(
     return reasoning_mask
 
 
+def swap_system_prompt_tokens(
+    model_input: tinker.ModelInput,
+    tokenizer: Tokenizer,
+    new_system_prompt: str,
+) -> tinker.ModelInput:
+    """
+    Replace the system prompt tokens in a ModelInput with new content.
+
+    Assumes Qwen3 chat template: <|im_start|>system\\n{content}<|im_end|>\\n
+
+    Returns a new ModelInput with the swapped system tokens. Raises ValueError
+    if system message boundaries cannot be located in the token sequence.
+    """
+    tokens = model_input.to_ints()
+
+    im_start_tokens = tokenizer.encode("<|im_start|>", add_special_tokens=False)
+    im_end_tokens = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    system_role_tokens = tokenizer.encode("system\n", add_special_tokens=False)
+
+    # Locate <|im_start|>system\n
+    header_tokens = im_start_tokens + system_role_tokens
+    system_start = -1
+    for i in range(len(tokens) - len(header_tokens) + 1):
+        if tokens[i : i + len(header_tokens)] == header_tokens:
+            system_start = i
+            break
+
+    if system_start < 0:
+        raise ValueError("Could not find system message start tokens in sequence")
+
+    # Locate the next <|im_end|> after the header
+    system_end = -1
+    search_start = system_start + len(header_tokens)
+    for i in range(search_start, len(tokens) - len(im_end_tokens) + 1):
+        if tokens[i : i + len(im_end_tokens)] == im_end_tokens:
+            system_end = i + len(im_end_tokens)
+            break
+
+    if system_end < 0:
+        raise ValueError("Could not find system message end tokens in sequence")
+
+    # Include trailing newline if present
+    newline_tokens = tokenizer.encode("\n", add_special_tokens=False)
+    if (
+        system_end + len(newline_tokens) <= len(tokens)
+        and tokens[system_end : system_end + len(newline_tokens)] == newline_tokens
+    ):
+        system_end += len(newline_tokens)
+
+    # Build replacement: <|im_start|>system\n{new_content}<|im_end|>\n
+    content_tokens = tokenizer.encode(new_system_prompt, add_special_tokens=False)
+    new_system_tokens = (
+        im_start_tokens + system_role_tokens + content_tokens + im_end_tokens + newline_tokens
+    )
+
+    new_tokens = tokens[:system_start] + new_system_tokens + tokens[system_end:]
+    return tinker.ModelInput.from_ints(new_tokens)
+
+
 @scope
 async def incorporate_kl_penalty(
     data_D: List[tinker.Datum],
@@ -142,6 +201,7 @@ async def incorporate_kl_penalty(
     tokenizer: Tokenizer,
     sample_start_index: int = 0,
     format_penalty: float = 0.0,
+    teacher_system_prompt: str | None = None,
 ) -> Dict[str, float]:
     """
     Compute reverse KL between the student (log p) and the teacher model (log q), computed as
@@ -149,6 +209,9 @@ async def incorporate_kl_penalty(
     
     Reasoning tokens (from <think> through </think>, inclusive of the tags) have their
     KL penalty scaled by reasoning_kl_multiplier (1.0 = full penalty, 0.0 = no penalty).
+
+    When teacher_system_prompt is provided, the teacher sees a modified sequence with
+    the system prompt replaced, while all student-side data remains unchanged.
 
     Args:
         data_D: List of datums to compute KL for
@@ -160,19 +223,35 @@ async def incorporate_kl_penalty(
         tokenizer: Tokenizer to identify reasoning tokens
         sample_start_index: Starting index for sample counting
         format_penalty: Penalty applied to advantages when think tags are malformed/missing
+        teacher_system_prompt: If set, replace the system prompt in the teacher's input
     """
-    # Note: if your teacher has a different renderer than the student, you may want to modify
-    #       the full_sequence_inputs_D to match the teacher's renderer.
     full_sequence_inputs_D = [
         datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
         for datum in data_D
     ]
+
+    # Build teacher-side inputs: swap system prompt if a teacher override is configured
+    if teacher_system_prompt is not None:
+        teacher_inputs_D: list[tinker.ModelInput] = []
+        for i, seq in enumerate(full_sequence_inputs_D):
+            try:
+                teacher_inputs_D.append(
+                    swap_system_prompt_tokens(seq, tokenizer, teacher_system_prompt)
+                )
+            except ValueError:
+                logger.warning(
+                    f"Could not swap system prompt for datum {i}; "
+                    "falling back to original sequence for teacher logprobs"
+                )
+                teacher_inputs_D.append(seq)
+    else:
+        teacher_inputs_D = full_sequence_inputs_D
     # Compute the teacher's logprobs for each element of the batch
     # Each datum uses its corresponding teacher sampling client
     teacher_logprobs_D = await asyncio.gather(
         *[
-            teacher_client.compute_logprobs_async(sequence_input)
-            for teacher_client, sequence_input in zip(teacher_clients_D, full_sequence_inputs_D)
+            teacher_client.compute_logprobs_async(teacher_input)
+            for teacher_client, teacher_input in zip(teacher_clients_D, teacher_inputs_D)
         ]
     )
     # The reverse KL is computed as KL[p||q] = log p - log q, where
@@ -343,6 +422,9 @@ class Config:
     format_violation_threshold: float = 0.5
     format_violation_patience: int = 3
 
+    # If set, teacher logprobs use this system prompt instead of the student's
+    teacher_system_prompt: str | None = None
+
     # Loss function and configuration.
     # See https://tinker-docs.thinkingmachines.ai/losses
     loss_fn: LossFnType = "importance_sampling"
@@ -376,6 +458,7 @@ async def prepare_minibatch(
     reasoning_kl_multiplier: float,
     sample_start_index: int = 0,
     format_penalty: float = 0.0,
+    teacher_system_prompt: str | None = None,
 ) -> tuple[list[tinker.Datum], dict[str, Any], int]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
@@ -420,6 +503,7 @@ async def prepare_minibatch(
                 tokenizer,
                 sample_start_index,
                 format_penalty=format_penalty,
+                teacher_system_prompt=teacher_system_prompt,
             )
         metrics.update(kl_penalty_metrics)
 
@@ -453,6 +537,7 @@ async def do_train_step_and_get_sampling_client(
         reasoning_kl_multiplier=cfg.reasoning_kl_multiplier,
         sample_start_index=sample_start_index,
         format_penalty=cfg.format_penalty,
+        teacher_system_prompt=cfg.teacher_system_prompt,
     )
     metrics.update(prepare_minibatch_metrics)
 
