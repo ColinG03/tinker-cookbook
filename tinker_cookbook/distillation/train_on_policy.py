@@ -260,11 +260,12 @@ async def incorporate_kl_penalty(
     sampled_logprobs_D = [datum.loss_fn_inputs["logprobs"].to_torch() for datum in data_D]
     float_masks = [datum.loss_fn_inputs["mask"].to_torch().float() for datum in data_D]
     reverse_kl = [
-        (sampled_logprobs - torch.tensor(teacher_logprobs[1:])) * mask
+        (sampled_logprobs - torch.tensor(teacher_logprobs[-len(sampled_logprobs):])) * mask
         for teacher_logprobs, sampled_logprobs, mask in safezip(
             teacher_logprobs_D, sampled_logprobs_D, float_masks
         )
     ]
+
     # Track per-dataset KL for logging, split by thinking vs response
     # dataset_idx -> (thinking_kl_sum, thinking_mask_sum, response_kl_sum, response_mask_sum)
     per_dataset_kl: Dict[int, tuple[float, float, float, float]] = {}

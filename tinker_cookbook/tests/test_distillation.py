@@ -269,16 +269,17 @@ def test_incorporate_kl_penalty_reasoning_multiplier():
 
 
 async def _test_incorporate_kl_penalty_length_mismatch_handling_async():
-    """Test that length mismatches are handled gracefully."""
-    import logging
-    
+    """Test that teacher logprobs shorter than sampled_logprobs raises a RuntimeError."""
     tokenizer = get_tokenizer("Qwen/Qwen3-8B")
-    
-    # Create a simple datum
-    tokens = tokenizer.encode("Hello world", add_special_tokens=False)
+
+    # Use a longer sentence so sampled_logprobs has more tokens than the mock teacher returns
+    tokens = tokenizer.encode(
+        "The quick brown fox jumps over the lazy dog and keeps on running",
+        add_special_tokens=False,
+    )
     model_input = tinker.ModelInput.from_ints(tokens[:-1])
     target_tokens = tokens[1:]
-    
+
     datum = tinker.Datum(
         model_input=model_input,
         loss_fn_inputs={
@@ -288,29 +289,13 @@ async def _test_incorporate_kl_penalty_length_mismatch_handling_async():
             "advantages": tinker.TensorData.from_torch(torch.zeros(len(target_tokens))),
         },
     )
-    
-    # Create mock teacher client that returns wrong length
+
+    # Return far fewer logprobs than needed — this is a genuine length mismatch
     teacher_client = MagicMock()
-    # Return logprobs with wrong length (too short)
-    teacher_logprobs = [0.0, 0.1, 0.2]  # Only 3 values, but should be more
-    teacher_client.compute_logprobs_async = AsyncMock(return_value=teacher_logprobs)
-    
-    # Capture log messages
-    log_records = []
-    
-    def log_handler(record):
-        log_records.append(record)
-    
-    # Add handler to logger
-    logger = logging.getLogger("tinker_cookbook.distillation.train_on_policy")
-    handler = logging.Handler()
-    handler.emit = log_handler
-    logger.addHandler(handler)
-    logger.setLevel(logging.WARNING)
-    
-    try:
-        # This should not crash, but should log a warning and use uniform multiplier
-        metrics = await incorporate_kl_penalty(
+    teacher_client.compute_logprobs_async = AsyncMock(return_value=[0.0, 0.1, 0.2])
+
+    with pytest.raises(RuntimeError):
+        await incorporate_kl_penalty(
             data_D=[datum],
             teacher_clients_D=[teacher_client],
             dataset_indices_D=[0],
@@ -320,16 +305,6 @@ async def _test_incorporate_kl_penalty_length_mismatch_handling_async():
             tokenizer=tokenizer,
             sample_start_index=0,
         )
-        
-        # Should still return metrics (graceful degradation)
-        assert "teacher_kl" in metrics
-        
-        # Should have logged a warning about length mismatch
-        assert len(log_records) > 0
-        assert any("mismatch" in record.getMessage().lower() for record in log_records), \
-            "Should log a warning about length mismatch"
-    finally:
-        logger.removeHandler(handler)
 
 
 def test_incorporate_kl_penalty_length_mismatch_handling():
