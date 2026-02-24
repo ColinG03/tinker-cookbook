@@ -186,9 +186,11 @@ async def incorporate_kl_penalty(
             teacher_logprobs_D, sampled_logprobs_D, float_masks
         )
     ]
-    # Track per-dataset KL for logging
-    # dataset_idx -> (sum of KL, sum of mask)
-    per_dataset_kl: Dict[int | str, tuple[float, float]] = {}
+    # Track per-dataset KL for logging, split by thinking vs response
+    # dataset_idx -> (thinking_kl_sum, thinking_mask_sum, response_kl_sum, response_mask_sum)
+    per_dataset_kl: Dict[int, tuple[float, float, float, float]] = {}
+    format_violation_count = 0.0
+    format_total_count = 0.0
 
     for i, datum in enumerate(data_D):
         sample_index = sample_start_index + i
@@ -198,7 +200,8 @@ async def incorporate_kl_penalty(
         reasoning_mask_full = identify_reasoning_tokens(full_sequence_inputs_D[i], tokenizer)
         
         reasoning_multiplier = reasoning_kl_multiplier
-        
+        reasoning_mask_target: torch.Tensor | None = None
+
         # The reverse_kl is computed for target tokens (teacher_logprobs[1:])
         # So we need to extract the reasoning mask for target positions (indices 1 onwards)
         seq_len = len(reverse_kl[i])
@@ -241,7 +244,7 @@ async def incorporate_kl_penalty(
                     f"seq_len: {seq_len}. "
                     f"Skipping reasoning token scaling for this datum."
                 )
-                # Fallback: use uniform multiplier (no reasoning token scaling)
+                reasoning_mask_target = None
                 kl_multiplier = torch.ones(seq_len)
             else:
                 # All checks passed - apply reasoning token scaling
@@ -267,40 +270,57 @@ async def incorporate_kl_penalty(
                 datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
                     datum.loss_fn_inputs["advantages"].to_torch() + format_advantages
                 )
-            if "__format_violations" not in per_dataset_kl:
-                per_dataset_kl["__format_violations"] = (0.0, 0.0)
-            prev_v, prev_t = per_dataset_kl["__format_violations"]
-            per_dataset_kl["__format_violations"] = (
-                prev_v + (0.0 if tags_ok else 1.0),
-                prev_t + 1.0,
-            )
+                format_violation_count += 1.0
+            format_total_count += 1.0
 
-        # Accumulate per-dataset KL
+        # Split KL into thinking vs response for logging
         dataset_idx = dataset_indices_D[i]
-        kl_sum = reverse_kl[i].sum().item()
-        mask_sum = float_masks[i].sum().item()
+        masked_kl = reverse_kl[i] * float_masks[i]
+        if reasoning_mask_target is not None:
+            thinking_kl = (masked_kl * reasoning_mask_target.float()).sum().item()
+            thinking_mask = (float_masks[i] * reasoning_mask_target.float()).sum().item()
+            response_kl = (masked_kl * (~reasoning_mask_target).float()).sum().item()
+            response_mask = (float_masks[i] * (~reasoning_mask_target).float()).sum().item()
+        else:
+            thinking_kl = 0.0
+            thinking_mask = 0.0
+            response_kl = masked_kl.sum().item()
+            response_mask = float_masks[i].sum().item()
+
         if dataset_idx not in per_dataset_kl:
-            per_dataset_kl[dataset_idx] = (0.0, 0.0)
-        prev_kl_sum, prev_mask_sum = per_dataset_kl[dataset_idx]
-        per_dataset_kl[dataset_idx] = (prev_kl_sum + kl_sum, prev_mask_sum + mask_sum)
+            per_dataset_kl[dataset_idx] = (0.0, 0.0, 0.0, 0.0)
+        pt_kl, pt_m, pr_kl, pr_m = per_dataset_kl[dataset_idx]
+        per_dataset_kl[dataset_idx] = (
+            pt_kl + thinking_kl, pt_m + thinking_mask,
+            pr_kl + response_kl, pr_m + response_mask,
+        )
 
-    # Compute average reverse KL over the batch for logging purposes
-    avg_logp_diff = sum([diff.sum() for diff in reverse_kl]) / sum(
-        [mask.sum() for mask in float_masks]
-    )
+    # Compute global and per-dataset KL metrics split by thinking vs response
+    total_kl = sum(t_kl + r_kl for t_kl, _, r_kl, _ in per_dataset_kl.values())
+    total_mask = sum(t_m + r_m for _, t_m, _, r_m in per_dataset_kl.values())
+    total_thinking_kl = sum(t_kl for t_kl, _, _, _ in per_dataset_kl.values())
+    total_thinking_mask = sum(t_m for _, t_m, _, _ in per_dataset_kl.values())
+    total_response_kl = sum(r_kl for _, _, r_kl, _ in per_dataset_kl.values())
+    total_response_mask = sum(r_m for _, _, _, r_m in per_dataset_kl.values())
 
-    # Extract format violation stats before iterating per-dataset KL
-    format_violations = per_dataset_kl.pop("__format_violations", None)
+    metrics: Dict[str, float] = {}
+    if total_mask > 0:
+        metrics["teacher_kl"] = total_kl / total_mask
+    if total_thinking_mask > 0:
+        metrics["teacher_kl/thinking"] = total_thinking_kl / total_thinking_mask
+    if total_response_mask > 0:
+        metrics["teacher_kl/response"] = total_response_kl / total_response_mask
 
-    # Compute per-dataset metrics
-    metrics = {"teacher_kl": float(avg_logp_diff)}
-    for dataset_idx, (kl_sum, mask_sum) in per_dataset_kl.items():
-        if mask_sum > 0:
-            metrics[f"teacher_kl/dataset_{dataset_idx}"] = float(kl_sum / mask_sum)
+    for dataset_idx, (t_kl, t_m, r_kl, r_m) in per_dataset_kl.items():
+        if t_m + r_m > 0:
+            metrics[f"teacher_kl/dataset_{dataset_idx}"] = (t_kl + r_kl) / (t_m + r_m)
+        if t_m > 0:
+            metrics[f"teacher_kl/dataset_{dataset_idx}/thinking"] = t_kl / t_m
+        if r_m > 0:
+            metrics[f"teacher_kl/dataset_{dataset_idx}/response"] = r_kl / r_m
 
-    if format_violations is not None:
-        v, t = format_violations
-        metrics["think_tag_violation_rate"] = float(v / t) if t > 0 else 0.0
+    if format_total_count > 0:
+        metrics["think_tag_violation_rate"] = format_violation_count / format_total_count
 
     return metrics
 
