@@ -202,6 +202,8 @@ async def incorporate_kl_penalty(
     sample_start_index: int = 0,
     format_penalty: float = 0.0,
     teacher_system_prompt: str | None = None,
+    thinking_penalty_threshold: int = 0,
+    thinking_penalty_per_token: float = 0.0,
 ) -> Dict[str, float]:
     """
     Compute reverse KL between the student (log p) and the teacher model (log q), computed as
@@ -209,6 +211,10 @@ async def incorporate_kl_penalty(
     
     Reasoning tokens (from <think> through </think>, inclusive of the tags) have their
     KL penalty scaled by reasoning_kl_multiplier (1.0 = full penalty, 0.0 = no penalty).
+
+    When thinking_penalty_threshold > 0 and thinking_penalty_per_token > 0, a flat penalty
+    is applied to advantage positions corresponding to thinking tokens whenever the total
+    thinking token count exceeds the threshold.
 
     When teacher_system_prompt is provided, the teacher sees a modified sequence with
     the system prompt replaced, while all student-side data remains unchanged.
@@ -224,6 +230,8 @@ async def incorporate_kl_penalty(
         sample_start_index: Starting index for sample counting
         format_penalty: Penalty applied to advantages when think tags are malformed/missing
         teacher_system_prompt: If set, replace the system prompt in the teacher's input
+        thinking_penalty_threshold: Token count above which the length penalty kicks in
+        thinking_penalty_per_token: Per-token penalty magnitude for excess thinking tokens
     """
     full_sequence_inputs_D = [
         datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
@@ -271,6 +279,9 @@ async def incorporate_kl_penalty(
     per_dataset_kl: Dict[int, tuple[float, float, float, float]] = {}
     format_violation_count = 0.0
     format_total_count = 0.0
+    total_thinking_tokens_count = 0.0
+    total_thinking_length_penalty = 0.0
+    total_datum_count = 0.0
 
     for i, datum in enumerate(data_D):
         sample_index = sample_start_index + i
@@ -353,6 +364,24 @@ async def incorporate_kl_penalty(
                 format_violation_count += 1.0
             format_total_count += 1.0
 
+        # Thinking length penalty: discourage excessively long reasoning
+        thinking_token_count = int(reasoning_mask_target.sum().item()) if reasoning_mask_target is not None else 0
+        total_thinking_tokens_count += thinking_token_count
+        total_datum_count += 1.0
+
+        if (
+            thinking_penalty_per_token > 0
+            and thinking_penalty_threshold > 0
+            and reasoning_mask_target is not None
+            and thinking_token_count > thinking_penalty_threshold
+        ):
+            excess = thinking_token_count - thinking_penalty_threshold
+            penalty = excess * thinking_penalty_per_token
+            total_thinking_length_penalty += penalty
+            advantages = datum.loss_fn_inputs["advantages"].to_torch()
+            advantages[reasoning_mask_target] -= penalty
+            datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(advantages)
+
         # Split KL into thinking vs response for logging
         dataset_idx = dataset_indices_D[i]
         masked_kl = reverse_kl[i] * float_masks[i]
@@ -402,6 +431,10 @@ async def incorporate_kl_penalty(
     if format_total_count > 0:
         metrics["think_tag_violation_rate"] = format_violation_count / format_total_count
 
+    if total_datum_count > 0:
+        metrics["thinking_tokens_per_turn"] = total_thinking_tokens_count / total_datum_count
+        metrics["thinking_length_penalty"] = total_thinking_length_penalty / total_datum_count
+
     return metrics
 
 
@@ -422,6 +455,9 @@ class Config:
     format_penalty: float = 0.0
     format_violation_threshold: float = 0.5
     format_violation_patience: int = 3
+
+    thinking_penalty_threshold: int = 0
+    thinking_penalty_per_token: float = 0.0
 
     # If set, teacher logprobs use this system prompt instead of the student's
     teacher_system_prompt: str | None = None
@@ -460,6 +496,8 @@ async def prepare_minibatch(
     sample_start_index: int = 0,
     format_penalty: float = 0.0,
     teacher_system_prompt: str | None = None,
+    thinking_penalty_threshold: int = 0,
+    thinking_penalty_per_token: float = 0.0,
 ) -> tuple[list[tinker.Datum], dict[str, Any], int]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
@@ -505,6 +543,8 @@ async def prepare_minibatch(
                 sample_start_index,
                 format_penalty=format_penalty,
                 teacher_system_prompt=teacher_system_prompt,
+                thinking_penalty_threshold=thinking_penalty_threshold,
+                thinking_penalty_per_token=thinking_penalty_per_token,
             )
         metrics.update(kl_penalty_metrics)
 
@@ -539,6 +579,8 @@ async def do_train_step_and_get_sampling_client(
         sample_start_index=sample_start_index,
         format_penalty=cfg.format_penalty,
         teacher_system_prompt=cfg.teacher_system_prompt,
+        thinking_penalty_threshold=cfg.thinking_penalty_threshold,
+        thinking_penalty_per_token=cfg.thinking_penalty_per_token,
     )
     metrics.update(prepare_minibatch_metrics)
 
