@@ -481,6 +481,7 @@ class Config:
     eval_every: int = 20
     save_every: int = 20
     load_checkpoint_path: str | None = None
+    load_weights_only: bool = True
 
 
 @scope
@@ -754,9 +755,13 @@ async def main(
         resume_info["state_path"] if resume_info else cfg.load_checkpoint_path
     )
     if load_state_path:
-        future = await training_client.load_state_with_optimizer_async(load_state_path)
+        if cfg.load_weights_only and not resume_info:
+            future = await training_client.load_state_async(load_state_path)
+        else:
+            future = await training_client.load_state_with_optimizer_async(load_state_path)
         _ = await future.result_async()
-        logger.info(f"Loaded state from {load_state_path}")
+        weights_only = cfg.load_weights_only and not resume_info
+        logger.info(f"Loaded state from {load_state_path} (weights_only={weights_only})")
 
     # Get tokenizer from training client
     tokenizer = training_client.get_tokenizer()
