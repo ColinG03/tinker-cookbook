@@ -463,6 +463,7 @@ class Config:
     learning_rate: float
     dataset_configs: List[DistillationDatasetConfig]
     model_name: str
+    renderer_name: str | None = None
     max_tokens: int
     temperature: float = 1.0
     compute_post_kl: bool = False
@@ -503,6 +504,9 @@ class Config:
     save_every: int = 20
     load_checkpoint_path: str | None = None
     load_weights_only: bool = True
+
+    # Maximum number of training steps. If None, train on the full dataset.
+    max_step: int | None = None
 
 
 @scope
@@ -771,14 +775,22 @@ async def main(
         start_batch = 0
 
     service_client = tinker.ServiceClient(base_url=cfg.base_url)
+    user_metadata: dict[str, str] = {}
+    if wandb_link := ml_logger.get_logger_url():
+        user_metadata["wandb_link"] = wandb_link
+    checkpoint_utils.add_renderer_name_to_user_metadata(user_metadata, cfg.renderer_name)
+
     training_client = await service_client.create_lora_training_client_async(
-        cfg.model_name, rank=cfg.lora_rank
+        cfg.model_name, rank=cfg.lora_rank, user_metadata=user_metadata
     )
 
     load_state_path: str | None = (
         resume_info["state_path"] if resume_info else cfg.load_checkpoint_path
     )
     if load_state_path:
+        await checkpoint_utils.check_renderer_name_for_checkpoint_async(
+            service_client, load_state_path, cfg.renderer_name
+        )
         if cfg.load_weights_only and not resume_info:
             future = await training_client.load_state_async(load_state_path)
         else:
@@ -824,7 +836,8 @@ async def main(
     # Wrap datasets in CompositeDataset
     composite_dataset = CompositeDataset(datasets, groups_per_batch_list)
     num_batches = len(composite_dataset)
-    logger.info(f"Will train on {num_batches} batches")
+    num_batches = min(cfg.max_step, num_batches) if cfg.max_step is not None else num_batches
+    logger.info(f"Will train on {num_batches} batches (dataset has {num_batches})")
 
     # Training loop
     await do_sync_training(

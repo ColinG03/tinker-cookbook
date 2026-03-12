@@ -22,9 +22,9 @@ Testing guidelines:
 - Keep tests focused on tricky logic, not trivial operations.
 """
 
-from typing import Callable, cast
 import copy
 import json
+from typing import Callable, cast
 
 import pytest
 import tinker
@@ -40,12 +40,25 @@ from tinker_cookbook.renderers import (
     TextPart,
     ThinkingPart,
     ToolCall,
+    TrainOnWhat,
+    get_registered_renderer_names,
     get_renderer,
+    is_renderer_registered,
+    register_renderer,
+    unregister_renderer,
 )
 from tinker_cookbook.renderers.base import ensure_list, ensure_text
+from tinker_cookbook.renderers.kimi_k2 import KimiK2Renderer
+from tinker_cookbook.renderers.kimi_k25 import KimiK25Renderer
+from tinker_cookbook.renderers.qwen3_5 import Qwen3_5DisableThinkingRenderer, Qwen3_5Renderer
 from tinker_cookbook.tests.conversation_generator import generate_conversation
-from tinker_cookbook.tokenizer_utils import get_tokenizer
-
+from tinker_cookbook.tokenizer_utils import (
+    get_registered_tokenizer_names,
+    get_tokenizer,
+    is_tokenizer_registered,
+    register_tokenizer,
+    unregister_tokenizer,
+)
 
 # =============================================================================
 # Test Conversation Definitions
@@ -363,6 +376,7 @@ TOOL_CAPABLE_MODELS = {
     "Qwen/Qwen3-30B-A3B",
     "Qwen/Qwen3-30B-A3B-Instruct-2507",
     "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "Qwen/Qwen3.5-35B-A3B",
     "meta-llama/Llama-3.2-1B-Instruct",
     "deepseek-ai/DeepSeek-V3.1",
     "moonshotai/Kimi-K2-Thinking",
@@ -389,6 +403,8 @@ _HF_TEST_MODELS = [
     ("openai/gpt-oss-20b", None, {}),
     ("moonshotai/Kimi-K2-Thinking", None, {}),
     ("Qwen/Qwen3-VL-30B-A3B-Instruct", None, {}),
+    ("Qwen/Qwen3.5-35B-A3B", None, {}),
+    ("Qwen/Qwen3.5-35B-A3B", "qwen3_5_disable_thinking", {"enable_thinking": False}),
 ]
 
 # Models whose tool call format matches HF's apply_chat_template exactly.
@@ -399,6 +415,7 @@ _HF_TOOL_COMPATIBLE_MODELS = {
     "Qwen/Qwen3-30B-A3B",
     "Qwen/Qwen3-30B-A3B-Instruct-2507",
     "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "Qwen/Qwen3.5-35B-A3B",
     "deepseek-ai/DeepSeek-V3.1",
     "moonshotai/Kimi-K2-Thinking",
 }
@@ -510,6 +527,8 @@ _SUPERVISED_TEST_MODELS = [
     ("deepseek-ai/DeepSeek-V3.1", "deepseekv3_thinking", {"thinking": True}),  # thinking mode
     ("moonshotai/Kimi-K2-Thinking", None, {}),
     ("Qwen/Qwen3-VL-30B-A3B-Instruct", None, {}),
+    ("Qwen/Qwen3.5-35B-A3B", None, {}),
+    ("Qwen/Qwen3.5-35B-A3B", "qwen3_5_disable_thinking", {"enable_thinking": False}),
 ]
 
 # Conversations for supervised tests (end with assistant message)
@@ -643,6 +662,7 @@ def test_tokenization_boundary_with_whitespace(model_name: str):
     "model_name",
     [
         "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3.5-35B-A3B",
         # Llama3 does not support tool calling - see llama3.py docstring
         "deepseek-ai/DeepSeek-V3.1",
         "moonshotai/Kimi-K2-Thinking",
@@ -700,7 +720,10 @@ def test_tool_call_supervised_rendering(model_name: str):
     "model_name,renderer_class",
     [
         ("Qwen/Qwen3-8B", Qwen3Renderer),
+        ("Qwen/Qwen3.5-35B-A3B", Qwen3_5Renderer),
         ("deepseek-ai/DeepSeek-V3.1", DeepSeekV3ThinkingRenderer),
+        ("moonshotai/Kimi-K2-Thinking", KimiK2Renderer),
+        ("moonshotai/Kimi-K2.5", KimiK25Renderer),
     ],
 )
 def test_strip_thinking_from_history_default(model_name: str, renderer_class):
@@ -727,7 +750,10 @@ def test_strip_thinking_from_history_default(model_name: str, renderer_class):
     "model_name,renderer_class",
     [
         ("Qwen/Qwen3-8B", Qwen3Renderer),
+        ("Qwen/Qwen3.5-35B-A3B", Qwen3_5Renderer),
         ("deepseek-ai/DeepSeek-V3.1", DeepSeekV3ThinkingRenderer),
+        ("moonshotai/Kimi-K2-Thinking", KimiK2Renderer),
+        ("moonshotai/Kimi-K2.5", KimiK25Renderer),
     ],
 )
 def test_strip_thinking_from_history_false(model_name: str, renderer_class):
@@ -900,6 +926,8 @@ _CONSISTENCY_RENDERERS = [
     ("Qwen/Qwen3-8B", "qwen3"),
     ("Qwen/Qwen3-8B", "qwen3_disable_thinking"),
     ("Qwen/Qwen3-8B", "qwen3_instruct"),
+    ("Qwen/Qwen3.5-35B-A3B", "qwen3_5"),
+    ("Qwen/Qwen3.5-35B-A3B", "qwen3_5_disable_thinking"),
     ("deepseek-ai/DeepSeek-V3.1", "deepseekv3"),
     ("deepseek-ai/DeepSeek-V3.1", "deepseekv3_thinking"),
     ("openai/gpt-oss-20b", "gpt_oss_medium_reasoning"),
@@ -925,12 +953,17 @@ _RENDERERS_WITHOUT_THINKING_SUPPORT = {"llama3", "role_colon"}
 _RENDERERS_WITHOUT_TOOL_SUPPORT = {"role_colon"}
 
 # Renderers that strip thinking in non-thinking mode (conversation must not have ThinkingPart)
-_RENDERERS_WITH_THINKING_STRIPPING = {"qwen3_disable_thinking", "deepseekv3", "kimi_k2"}
+_RENDERERS_WITH_THINKING_STRIPPING = {
+    "qwen3_disable_thinking",
+    "qwen3_5_disable_thinking",
+    "deepseekv3",
+    "kimi_k2",
+}
 
 # Renderers where supervised and generation have different headers (HF thinking=True behavior).
 # These add </think> to supervised assistant headers but <think> to generation prompt,
 # so observation != generation_prompt by design.
-_RENDERERS_WITH_DIFFERENT_SUPERVISED_GEN_HEADERS = {"deepseekv3_thinking"}
+_RENDERERS_WITH_DIFFERENT_SUPERVISED_GEN_HEADERS = {"deepseekv3_thinking", "qwen3_5"}
 
 
 @pytest.mark.parametrize("conversation_fn", _CONSISTENCY_CONVERSATIONS)
@@ -1062,6 +1095,8 @@ def test_supervised_generation_parse_consistency(
     [
         ("Qwen/Qwen3-30B-A3B", "qwen3"),
         ("Qwen/Qwen3-8B", "qwen3_disable_thinking"),
+        ("Qwen/Qwen3.5-35B-A3B", "qwen3_5"),
+        ("Qwen/Qwen3.5-35B-A3B", "qwen3_5_disable_thinking"),
         ("meta-llama/Llama-3.2-1B-Instruct", "llama3"),
         # deepseekv3 defaults to non-thinking, deepseekv3_thinking is thinking mode
         ("deepseek-ai/DeepSeek-V3.1", "deepseekv3"),
@@ -1081,6 +1116,8 @@ def test_eot_parsing(model_name: str, renderer_name: str):
         "llama3": "<|eot_id|>",
         "qwen3": "<|im_end|>",
         "qwen3_disable_thinking": "<|im_end|>",
+        "qwen3_5": "<|im_end|>",
+        "qwen3_5_disable_thinking": "<|im_end|>",
         "deepseekv3": "<｜end▁of▁sentence｜>",  # Full-width pipes
         "deepseekv3_thinking": "<｜end▁of▁sentence｜>",  # Full-width pipes
         "deepseekv3_disable_thinking": "<｜end▁of▁sentence｜>",  # Full-width pipes (alias)
@@ -1223,6 +1260,377 @@ def test_deepseek_post_tool_formatting():
             )
 
 
+def test_kimi_k2_thinking_stripped_when_no_suffix_messages():
+    """
+    Kimi K2 should preserve thinking only after the last non-tool-call assistant.
+    This test checks that the history thinking is stripped with the presence of a non-tool-call assistant.
+    """
+    model_name = "moonshotai/Kimi-K2-Thinking"
+    tokenizer = get_tokenizer(model_name)
+    renderer = get_renderer("kimi_k2", tokenizer)
+
+    messages: list[Message] = [
+        {"role": "user", "content": "Q"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think A"),
+            ],
+            "tool_calls": [
+                ToolCall(
+                    function=ToolCall.FunctionBody(
+                        name="get_weather",
+                        arguments='{"location":"NYC"}',
+                    ),
+                    id="call_1",
+                )
+            ],
+        },
+        {"role": "tool", "content": '{"temperature": 72}', "tool_call_id": "call_1"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think B"),
+                TextPart(type="text", text="A"),
+            ],
+        },
+    ]
+
+    model_input, _ = renderer.build_supervised_example(messages)
+    decoded = tokenizer.decode(model_input.to_ints())
+
+    assert "think A" in decoded, f"Non-suffix thinking should be preserved: {decoded}"
+    assert "think B" in decoded, f"Non-suffix thinking should be preserved: {decoded}"
+    assert "A" in decoded, f"Non-suffix text should be preserved: {decoded}"
+
+    # all messages in `messages` will be history since we have a non-tool-call assistant before the newly added assistant (in the generated prompt)
+    model_input = renderer.build_generation_prompt(messages)
+    decoded = tokenizer.decode(model_input.to_ints())
+
+    assert "think A" not in decoded, f"History thinking should be stripped: {decoded}"
+    assert "think B" not in decoded, f"History thinking should be stripped: {decoded}"
+    assert "A" in decoded, f"History text should be preserved: {decoded}"
+
+
+def test_kimi_k2_thinking_preserved_in_suffix_after_last_non_tool_call():
+    """
+    Kimi K2 should preserve thinking only after the last non-tool-call assistant.
+    This test checks that the suffix thinking is preserved but the history thinking is stripped relative to the position of the last non-tool-call assistant.
+    """
+    model_name = "moonshotai/Kimi-K2-Thinking"
+    tokenizer = get_tokenizer(model_name)
+    renderer = get_renderer("kimi_k2", tokenizer)
+
+    messages: list[Message] = [
+        {"role": "user", "content": "Q1"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think A"),
+                TextPart(type="text", text="A1"),
+            ],
+            "tool_calls": [],
+        },
+        {"role": "user", "content": "Q2"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think B"),
+            ],
+            "tool_calls": [
+                ToolCall(
+                    function=ToolCall.FunctionBody(
+                        name="get_weather",
+                        arguments='{"location":"NYC"}',
+                    ),
+                    id="call_1",
+                )
+            ],
+        },
+        {"role": "tool", "content": '{"temperature": 72}', "tool_call_id": "call_1"},
+    ]
+
+    model_input, _ = renderer.build_supervised_example(messages)
+    decoded = tokenizer.decode(model_input.to_ints())
+
+    assert "think A" not in decoded, f"History thinking should be stripped: {decoded}"
+    assert "A1" in decoded, f"History text should be preserved: {decoded}"
+    assert "think B" in decoded, f"Suffix thinking should be preserved: {decoded}"
+
+    model_input = renderer.build_generation_prompt(messages)
+    decoded = tokenizer.decode(model_input.to_ints())
+
+    assert "think A" not in decoded, f"History thinking should be stripped: {decoded}"
+    assert "A1" in decoded, f"History text should be preserved: {decoded}"
+    assert "think B" in decoded, f"Suffix thinking should be preserved: {decoded}"
+
+
+def test_kimi_k2_thinking_preserved_when_no_non_tool_call_assistant():
+    """
+    Kimi K2 should preserve thinking only after the last non-tool-call assistant.
+    This test checks that the suffix thinking is preserved but the history thinking is stripped relative to the position of the last non-tool-call assistant.
+    """
+    model_name = "moonshotai/Kimi-K2-Thinking"
+    tokenizer = get_tokenizer(model_name)
+    renderer = get_renderer("kimi_k2", tokenizer)
+
+    messages: list[Message] = [
+        {"role": "user", "content": "Q"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think A"),
+            ],
+            "tool_calls": [
+                ToolCall(
+                    function=ToolCall.FunctionBody(
+                        name="get_weather",
+                        arguments='{"location":"NYC"}',
+                    ),
+                    id="call_1",
+                )
+            ],
+        },
+        {"role": "tool", "content": '{"temperature": 72}', "tool_call_id": "call_1"},
+    ]
+
+    model_input, _ = renderer.build_supervised_example(messages)
+    decoded = tokenizer.decode(model_input.to_ints())
+
+    assert "think A" in decoded, f"Suffix thinking should be preserved: {decoded}"
+
+
+# =============================================================================
+# Kimi K2 build_supervised_examples Tests
+# =============================================================================
+
+
+def test_kimi_k2_build_supervised_examples_last_assistant_matches():
+    model_name = "moonshotai/Kimi-K2-Thinking"
+    tokenizer = get_tokenizer(model_name)
+    renderer: KimiK2Renderer = get_renderer("kimi_k2", tokenizer)  # type: ignore
+
+    messages = get_basic_4turn_conversation()
+
+    single_input, single_weights = renderer.build_supervised_example(messages)
+    examples = renderer.build_supervised_examples(
+        messages, train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE
+    )
+
+    assert len(examples) == 1, "Expected a single supervised example"
+    list_input, list_weights = examples[0]
+    assert list_input.to_ints() == single_input.to_ints()
+    assert list_weights.tolist() == single_weights.tolist()
+
+
+def test_kimi_k2_build_supervised_examples_all_assistant_matches():
+    model_name = "moonshotai/Kimi-K2-Thinking"
+    tokenizer = get_tokenizer(model_name)
+    renderer: KimiK2Renderer = get_renderer("kimi_k2", tokenizer)  # type: ignore
+
+    messages: list[Message] = [
+        {"role": "user", "content": "Q1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "Q2"},
+        {"role": "assistant", "content": "A2"},
+        {"role": "user", "content": "Q3"},
+        {"role": "assistant", "content": "A3"},
+    ]
+
+    examples = renderer.build_supervised_examples(
+        messages, train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES
+    )
+
+    assert len(examples) == 3, (
+        "Expected one example per user turn after the first and one for the full conversation"
+    )
+
+    ex0_tokens = examples[0][0].to_ints()
+    ex1_tokens = examples[1][0].to_ints()
+    ex2_tokens = examples[2][0].to_ints()
+    ex0_decoded = tokenizer.decode(ex0_tokens)
+    ex1_decoded = tokenizer.decode(ex1_tokens)
+    ex2_decoded = tokenizer.decode(ex2_tokens)
+
+    assert "A1" in ex0_decoded
+    assert "A2" not in ex0_decoded
+    assert "A3" not in ex0_decoded
+
+    assert "A1" in ex1_decoded
+    assert "A2" in ex1_decoded
+    assert "A3" not in ex1_decoded
+
+    assert "A1" in ex2_decoded
+    assert "A2" in ex2_decoded
+    assert "A3" in ex2_decoded
+
+
+def test_kimi_k2_build_supervised_examples_warns_on_non_assistant_mode():
+    model_name = "moonshotai/Kimi-K2-Thinking"
+    tokenizer = get_tokenizer(model_name)
+    renderer: KimiK2Renderer = get_renderer("kimi_k2", tokenizer)  # type: ignore
+
+    messages = get_basic_4turn_conversation()
+
+    with pytest.warns(UserWarning, match="does not satisfy the extension property"):
+        examples = renderer.build_supervised_examples(
+            messages, train_on_what=TrainOnWhat.ALL_MESSAGES
+        )
+
+    assert len(examples) == 2, (
+        "Expected one example for the full conversation and one for the last user turn"
+    )
+    ex0_tokens = examples[0][0].to_ints()
+    ex1_tokens = examples[1][0].to_ints()
+    ex0_decoded = tokenizer.decode(ex0_tokens)
+    ex1_decoded = tokenizer.decode(ex1_tokens)
+
+    assert "2+2" in ex0_decoded
+    assert "4" in ex0_decoded
+    assert "3+3" not in ex0_decoded
+    assert "6" not in ex0_decoded
+
+    assert "2+2" in ex1_decoded
+    assert "4" in ex1_decoded
+    assert "3+3" in ex1_decoded
+    assert "6" in ex1_decoded
+
+
+def test_kimi_k2_build_supervised_examples_all_assistant_matches_with_tool_calls():
+    model_name = "moonshotai/Kimi-K2-Thinking"
+    tokenizer = get_tokenizer(model_name)
+    renderer: KimiK2Renderer = get_renderer("kimi_k2", tokenizer)  # type: ignore
+
+    messages: list[Message] = [
+        {"role": "user", "content": "Q"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think A"),
+            ],
+            "tool_calls": [
+                ToolCall(
+                    function=ToolCall.FunctionBody(
+                        name="get_weather",
+                        arguments='{"location":"NYC"}',
+                    ),
+                    id="call_1",
+                )
+            ],
+        },
+        {"role": "tool", "content": '{"temperature": 72}', "tool_call_id": "call_1"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think B"),
+                TextPart(type="text", text="A"),
+            ],
+        },
+        {"role": "user", "content": "Q2"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think C"),
+            ],
+            "tool_calls": [
+                ToolCall(
+                    function=ToolCall.FunctionBody(
+                        name="get_weather",
+                        arguments='{"location":"NYC"}',
+                    ),
+                    id="call_1",
+                )
+            ],
+        },
+        {"role": "tool", "content": '{"temperature": 72}', "tool_call_id": "call_1"},
+        {
+            "role": "assistant",
+            "content": [
+                ThinkingPart(type="thinking", thinking="think D"),
+                TextPart(type="text", text="A2"),
+            ],
+        },
+    ]
+
+    examples = renderer.build_supervised_examples(
+        messages, train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES
+    )
+
+    assert len(examples) == 2
+    example0_input, example0_weights = examples[0]
+    example1_input, example1_weights = examples[1]
+
+    expected_input, expected_weights = renderer.build_supervised_example(
+        messages[:4], train_on_what=TrainOnWhat.LAST_ASSISTANT_TURN
+    )
+    all_assist_input, all_assist_weights = renderer.build_supervised_example(
+        messages[:4], train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES
+    )
+
+    assert example0_input.to_ints() == expected_input.to_ints()
+    assert example0_weights.tolist() == expected_weights.tolist()
+    # since we only have one turn in `messages[:4]`, the weights should be the same
+    assert example0_weights.tolist() == all_assist_weights.tolist()
+
+    expected_input, expected_weights = renderer.build_supervised_example(
+        messages, train_on_what=TrainOnWhat.LAST_ASSISTANT_TURN
+    )
+    all_assist_input, all_assist_weights = renderer.build_supervised_example(
+        messages, train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES
+    )
+
+    assert example1_input.to_ints() == expected_input.to_ints()
+    assert example1_weights.tolist() == expected_weights.tolist()
+    assert example1_weights.tolist() != all_assist_weights.tolist()
+
+
+# =============================================================================
+# No User Messages Edge Case Tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "model_name,renderer_name",
+    [
+        ("meta-llama/Llama-3.2-1B-Instruct", "llama3"),
+        ("Qwen/Qwen3-8B", "qwen3"),
+        ("Qwen/Qwen3.5-35B-A3B", "qwen3_5"),
+        ("Qwen/Qwen3.5-35B-A3B", "qwen3_5_disable_thinking"),
+        ("deepseek-ai/DeepSeek-V3.1", "deepseekv3"),
+    ],
+)
+def test_supervised_example_no_user_messages(model_name: str, renderer_name: str):
+    """Test that build_supervised_example doesn't crash when there are no user messages.
+
+    Regression test: previously, `max(idx for ... if role == 'user')` raised ValueError
+    on an empty sequence when no user messages were present. Now uses `default=-1`.
+    With LAST_ASSISTANT_MESSAGE and no user messages, all assistant tokens should be trained on
+    (since every message is "after the last user").
+    """
+    tokenizer = get_tokenizer(model_name)
+    renderer = get_renderer(renderer_name, tokenizer)
+
+    messages: list[Message] = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "assistant", "content": "Hello! How can I help you?"},
+    ]
+
+    # Should not raise ValueError
+    model_input, weights = renderer.build_supervised_example(
+        messages, train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE
+    )
+    tokens = model_input.to_ints()
+
+    assert len(tokens) > 0, "Should produce non-empty token sequence"
+    assert len(weights) == len(tokens), "Weights should match token count"
+
+    # With no user messages, the assistant message is "after the last user" (last_user_idx == -1),
+    # so the assistant tokens should have weight=1
+    assert any(w > 0 for w in weights.tolist()), (
+        "At least some tokens should have non-zero weight for LAST_ASSISTANT_MESSAGE with no user messages"
+    )
+
+
 # =============================================================================
 # Sequence Extension Property Tests
 # =============================================================================
@@ -1316,6 +1724,20 @@ _EXTENSION_PROPERTY_TEST_PARAMS = [
         {"strip_thinking_from_history": False},
         get_multiturn_thinking_conversation,
     ),
+    # Qwen3.5 with strip_thinking_from_history=False (preserves thinking)
+    (
+        "Qwen/Qwen3.5-35B-A3B",
+        Qwen3_5Renderer,
+        {"strip_thinking_from_history": False},
+        get_multiturn_thinking_conversation,
+    ),
+    # Qwen3.5 disable thinking with strip_thinking_from_history=False (preserves thinking)
+    (
+        "Qwen/Qwen3.5-35B-A3B",
+        Qwen3_5DisableThinkingRenderer,
+        {"strip_thinking_from_history": False},
+        get_multiturn_thinking_conversation,
+    ),
     # DeepSeek non-thinking with basic multi-turn
     ("deepseek-ai/DeepSeek-V3.1", "deepseekv3", {}, get_basic_4turn_conversation),
     # DeepSeek non-thinking with tool calls
@@ -1379,3 +1801,86 @@ def test_extension_property_breaks_when_expected():
     # Extension should break - expect an assertion error
     with pytest.raises(AssertionError, match="Extension property violated"):
         _verify_extension_property(renderer, messages, tokenizer)
+
+
+@pytest.fixture
+def cleanup_custom_renderer():
+    """Fixture to ensure custom renderers are cleaned up after tests."""
+    registered_names: list[str] = []
+    yield registered_names
+    # Cleanup: unregister any renderers that were registered during the test
+    for name in registered_names:
+        unregister_renderer(name)
+
+
+def test_register_and_get_custom_renderer(cleanup_custom_renderer):
+    """Test that a custom renderer can be registered and retrieved via get_renderer."""
+    custom_name = "_test_custom_renderer_abc123"
+    cleanup_custom_renderer.append(custom_name)
+
+    # Should not be registered initially
+    assert not is_renderer_registered(custom_name)
+
+    # Create a simple factory that returns a Qwen3Renderer
+    def custom_factory(tokenizer, image_processor=None):
+        return Qwen3Renderer(tokenizer)
+
+    # Register the custom renderer
+    register_renderer(custom_name, custom_factory)
+
+    # Should now be registered
+    assert is_renderer_registered(custom_name)
+    names = get_registered_renderer_names()
+    assert custom_name in names
+
+    # Verify it can be retrieved
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+    renderer = get_renderer(custom_name, tokenizer)
+
+    assert isinstance(renderer, Qwen3Renderer)
+
+    unregister_renderer(custom_name)
+
+    with pytest.raises(ValueError, match="Unknown renderer"):
+        renderer = get_renderer(custom_name, tokenizer)
+
+
+@pytest.fixture
+def cleanup_custom_tokenizer():
+    """Fixture to ensure custom tokenizers are cleaned up after tests."""
+    registered_names: list[str] = []
+    yield registered_names
+    # Cleanup: unregister any tokenizers that were registered during the test
+    for name in registered_names:
+        unregister_tokenizer(name)
+
+
+def test_register_and_get_custom_tokenizer(cleanup_custom_tokenizer):
+    """Test that a custom tokenizer can be registered and retrieved via get_tokenizer."""
+    custom_name = "_test_custom_tokenizer_abc123"
+    cleanup_custom_tokenizer.append(custom_name)
+
+    # Should not be registered initially
+    assert not is_tokenizer_registered(custom_name)
+
+    # Create a simple factory that returns an existing tokenizer
+    real_tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    def custom_factory():
+        return real_tokenizer
+
+    # Register the custom tokenizer
+    register_tokenizer(custom_name, custom_factory)
+
+    # Should now be registered
+    assert is_tokenizer_registered(custom_name)
+    names = get_registered_tokenizer_names()
+    assert custom_name in names
+
+    # Verify it can be retrieved
+    tokenizer = get_tokenizer(custom_name)
+    assert tokenizer is real_tokenizer
+
+    # Unregister and verify it falls back to HF (which will fail for fake name)
+    unregister_tokenizer(custom_name)
+    assert not is_tokenizer_registered(custom_name)

@@ -1,10 +1,12 @@
 """Tests for the logtree module."""
 
 import asyncio
+import json
 import os
 import tempfile
 from pathlib import Path
 
+from tinker_cookbook.renderers.base import Message
 from tinker_cookbook.utils import logtree
 
 
@@ -27,6 +29,18 @@ def test_basic_trace():
         assert "Hello world" in content
         assert "Section 1" in content
         assert "Content in section 1" in content
+
+
+def test_log_text_renders_inline_text_node():
+    """Text-only paragraphs should render inline, without leading newline whitespace."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = Path(tmpdir) / "inline_text.html"
+
+        with logtree.init_trace("Inline Text Test", path=output_path):
+            logtree.log_text("parse_success: 0")
+
+        content = output_path.read_text()
+        assert '<p class="lt-p">parse_success: 0</p>' in content
 
 
 def test_nested_scopes():
@@ -328,6 +342,27 @@ def test_export_helpers():
         assert "<!doctype html>" in content.lower()
 
 
+def test_write_trace_json():
+    """Test writing trace structure to JSON."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = Path(tmpdir) / "trace.json"
+
+        with logtree.init_trace("Trace JSON Test", path=None) as trace:
+            logtree.log_text("Hello JSON")
+            with logtree.scope_header("Section"):
+                logtree.log_text("Nested text")
+
+        logtree.write_trace_json(trace, output_path)
+        content = json.loads(output_path.read_text())
+
+        assert content["title"] == "Trace JSON Test"
+        assert content["root"]["tag"] == "body"
+        assert "children" in content["root"]
+        serialized = json.dumps(content)
+        assert "Hello JSON" in serialized
+        assert "Section" in serialized
+
+
 def test_graceful_degradation():
     """Test that logtree functions work gracefully when no trace is active."""
 
@@ -375,7 +410,7 @@ def test_formatter():
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = Path(tmpdir) / "formatter.html"
 
-        messages = [
+        messages: list[Message] = [
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there!"},
             {"role": "user", "content": "How are you?"},
@@ -397,6 +432,31 @@ def test_formatter():
         assert "lt-message-role" in content
 
 
+def test_formatter_html_escaping():
+    """Test that ConversationFormatter properly escapes HTML in message content to prevent XSS."""
+    from tinker_cookbook.utils.logtree_formatters import ConversationFormatter
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_path = Path(tmpdir) / "xss.html"
+
+        messages: list[Message] = [
+            {"role": "user", "content": "What is <script>alert('xss')</script>?"},
+            {"role": "assistant", "content": "That's a <b>script</b> tag: <img onerror=alert(1)>"},
+        ]
+
+        with logtree.init_trace("XSS Test", path=output_path):
+            logtree.log_formatter(ConversationFormatter(messages=messages))
+
+        content = output_path.read_text()
+
+        # HTML tags should be escaped (< and > become &lt; and &gt;), not rendered
+        assert "<script>" not in content
+        assert "&lt;script&gt;" in content
+        # The <img> tag should also be escaped
+        assert "<img onerror=" not in content
+        assert "&lt;img onerror=" in content
+
+
 def test_formatter_css_deduplication():
     """Test that formatter CSS is deduplicated per trace."""
     from tinker_cookbook.utils.logtree_formatters import ConversationFormatter
@@ -404,9 +464,9 @@ def test_formatter_css_deduplication():
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = Path(tmpdir) / "dedup.html"
 
-        messages1 = [{"role": "user", "content": "Message 1"}]
-        messages2 = [{"role": "assistant", "content": "Message 2"}]
-        messages3 = [{"role": "user", "content": "Message 3"}]
+        messages1: list[Message] = [{"role": "user", "content": "Message 1"}]
+        messages2: list[Message] = [{"role": "assistant", "content": "Message 2"}]
+        messages3: list[Message] = [{"role": "user", "content": "Message 3"}]
 
         with logtree.init_trace("Dedup Test", path=output_path):
             # Log three conversation formatters

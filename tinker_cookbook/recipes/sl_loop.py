@@ -30,6 +30,7 @@ class Config:
     train_on_what: renderers.TrainOnWhat = renderers.TrainOnWhat.ALL_ASSISTANT_MESSAGES
     lora_rank: int = 32
     save_every: int = 20  # 0 = disabled
+    ttl_seconds: int | None = 604800  # 7 days
 
 
 def main(config: Config):
@@ -54,7 +55,14 @@ def main(config: Config):
     assert isinstance(dataset, datasets.DatasetDict)
     train_dataset = dataset["train"]
 
+    # Drop the last incomplete batch (like PyTorch's drop_last=True) — a partial
+    # batch has different effective gradient magnitude, which can cause a training spike.
     n_train_batches = len(train_dataset) // config.batch_size
+    n_dropped = len(train_dataset) % config.batch_size
+    if n_dropped:
+        logger.info(
+            f"Dropping last {n_dropped} examples to keep batch size uniform at {config.batch_size}"
+        )
     logger.info(f"Train batches: {n_train_batches}")
 
     # Setup training client
@@ -93,6 +101,7 @@ def main(config: Config):
                 log_path=config.log_path,
                 kind="state",
                 loop_state={"batch": batch_idx},
+                ttl_seconds=config.ttl_seconds,
             )
 
         # Linear learning rate schedule
@@ -148,6 +157,7 @@ def main(config: Config):
         log_path=config.log_path,
         kind="both",
         loop_state={"batch": n_train_batches},
+        ttl_seconds=config.ttl_seconds,
     )
 
     ml_logger.close()

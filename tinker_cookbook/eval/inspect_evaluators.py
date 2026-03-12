@@ -24,7 +24,7 @@ class InspectEvaluatorBuilder:
 
     # Required parameters
     tasks: Tasks
-    renderer_name: str
+    renderer_name: str | None = None
     # TODO: remove model_name once the SDK adds a get_tokenizer method to sampling client
     model_name: str | None = None
     # Random seed for sampling. If None, sampling is non-deterministic.
@@ -50,6 +50,8 @@ class InspectEvaluatorBuilder:
     # Maximum concurrent sampling requests to Tinker.
     max_connections: int = 512
     log_level: str = "INFO"
+    # Metadata to associate with this evaluation run (visible in inspect logs)
+    metadata: Optional[dict[str, str]] = None
 
     def __call__(self) -> SamplingClientEvaluator:
         return InspectEvaluator(self)
@@ -78,6 +80,8 @@ class InspectEvaluator(SamplingClientEvaluator):
         """
         if self.config.model_name is None:
             raise ValueError("model_name must be set before running evaluation")
+        if self.config.renderer_name is None:
+            raise ValueError("renderer_name must be set before running evaluation")
         # Create the inspect API wrapper
         api = InspectAPIFromTinkerSampling(
             renderer_name=self.config.renderer_name,
@@ -115,6 +119,7 @@ class InspectEvaluator(SamplingClientEvaluator):
             log_level=self.config.log_level,
             log_realtime=False,
             log_buffer=1000,
+            metadata=self.config.metadata,
         )
 
         # Extract metrics from results
