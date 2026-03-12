@@ -5,9 +5,10 @@ https://thinkingmachines.ai/blog/on-policy-distillation
 
 import asyncio
 import logging
+import math
 import os
 import time
-from typing import Any, Dict, List, Sequence, cast
+from typing import Any, Dict, List, Literal, Sequence, cast
 
 import chz
 import tinker
@@ -204,11 +205,18 @@ async def incorporate_kl_penalty(
     teacher_system_prompt: str | None = None,
     thinking_penalty_threshold: int = 0,
     thinking_penalty_per_token: float = 0.0,
+    kl_type: str = "reverse_kl",
 ) -> Dict[str, float]:
     """
-    Compute reverse KL between the student (log p) and the teacher model (log q), computed as
-    log p - log q. We then adjust the advantages in-place as the negative reverse KL.
-    
+    Compute KL-based penalty between the student (log p) and the teacher model (log q).
+
+    When kl_type="reverse_kl" (default), computes reverse KL: log p - log q.
+    When kl_type="jsd", computes the Jensen-Shannon divergence contribution per token:
+        log_m - 0.5*(log_p + log_q), where log_m = log(0.5) + logaddexp(log_p, log_q).
+    JSD is symmetric, always non-negative, and equals 0 only when p == q.
+
+    In both cases we then adjust the advantages in-place as the negative of the penalty.
+
     Reasoning tokens (from <think> through </think>, inclusive of the tags) have their
     KL penalty scaled by reasoning_kl_multiplier (1.0 = full penalty, 0.0 = no penalty).
 
@@ -232,6 +240,7 @@ async def incorporate_kl_penalty(
         teacher_system_prompt: If set, replace the system prompt in the teacher's input
         thinking_penalty_threshold: Token count above which the length penalty kicks in
         thinking_penalty_per_token: Per-token penalty magnitude for excess thinking tokens
+        kl_type: Which divergence to use — "reverse_kl" (default) or "jsd"
     """
     full_sequence_inputs_D = [
         datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
@@ -262,17 +271,28 @@ async def incorporate_kl_penalty(
             for teacher_client, teacher_input in zip(teacher_clients_D, teacher_inputs_D)
         ]
     )
-    # The reverse KL is computed as KL[p||q] = log p - log q, where
-    #   - p: sampled_logprobs
-    #   - q: teacher_logprobs
+    # Compute the per-token KL approximation between student (log p) and teacher (log q).
+    # kl_type="reverse_kl": log p - log q  (asymmetric, can be negative)
+    # kl_type="jsd":        log_m - 0.5*(log_p + log_q)  (symmetric, always >= 0)
+    #   where log_m = log(0.5) + logaddexp(log_p, log_q)
+    # None entries in teacher_logprobs (e.g. BOS position) are replaced with log_p so
+    # their contribution cancels out (reverse_kl=0, jsd=0).
     sampled_logprobs_D = [datum.loss_fn_inputs["logprobs"].to_torch() for datum in data_D]
     float_masks = [datum.loss_fn_inputs["mask"].to_torch().float() for datum in data_D]
-    reverse_kl = [
-        (sampled_logprobs - torch.tensor(teacher_logprobs[-len(sampled_logprobs):])) * mask
-        for teacher_logprobs, sampled_logprobs, mask in safezip(
-            teacher_logprobs_D, sampled_logprobs_D, float_masks
-        )
-    ]
+    log_half = math.log(0.5)
+    kl_approx = []
+    for teacher_logprobs, sampled_logprobs, mask in safezip(
+        teacher_logprobs_D, sampled_logprobs_D, float_masks
+    ):
+        log_p = sampled_logprobs
+        log_q_raw = teacher_logprobs[-len(sampled_logprobs):]
+        log_q_list = [lp if lq is None else lq for lq, lp in zip(log_q_raw, log_p.tolist())]
+        log_q = torch.tensor(log_q_list, dtype=torch.float32)
+        if kl_type == "jsd":
+            log_m = log_half + torch.logaddexp(log_p, log_q)
+            kl_approx.append((log_m - 0.5 * (log_p + log_q)) * mask)
+        else:  # "reverse_kl"
+            kl_approx.append((log_p - log_q) * mask)
 
     # Track per-dataset KL for logging, split by thinking vs response
     # dataset_idx -> (thinking_kl_sum, thinking_mask_sum, response_kl_sum, response_mask_sum)
@@ -293,15 +313,15 @@ async def incorporate_kl_penalty(
         reasoning_multiplier = reasoning_kl_multiplier
         reasoning_mask_target: torch.Tensor | None = None
 
-        # The reverse_kl is computed for target tokens (teacher_logprobs[1:])
+        # The kl_approx is computed for target tokens (teacher_logprobs[1:])
         # So we need to extract the reasoning mask for target positions (indices 1 onwards)
-        seq_len = len(reverse_kl[i])
-        
+        seq_len = len(kl_approx[i])
+
         # Validate sequence length relationships with graceful fallback
         expected_full_length = len(full_sequence_inputs_D[i].to_ints())
         actual_mask_length = len(reasoning_mask_full)
         expected_target_length = expected_full_length - 1
-        
+
         # Check if reasoning mask length matches full sequence length
         if actual_mask_length != expected_full_length:
             logger.warning(
@@ -312,12 +332,12 @@ async def incorporate_kl_penalty(
             )
             # Fallback: use uniform multiplier (no reasoning token scaling)
             kl_multiplier = torch.ones(seq_len)
-        # Check if reverse_kl length matches expected target length
+        # Check if kl_approx length matches expected target length
         elif seq_len != expected_target_length:
             logger.warning(
-                f"Reverse KL length mismatch for datum {i} (sample {sample_index}): "
+                f"KL approx length mismatch for datum {i} (sample {sample_index}): "
                 f"expected {expected_target_length} (full_sequence - 1), "
-                f"got {seq_len} (from reverse_kl). "
+                f"got {seq_len} (from kl_approx). "
                 f"Skipping reasoning token scaling for this datum."
             )
             # Fallback: use uniform multiplier (no reasoning token scaling)
@@ -342,9 +362,9 @@ async def incorporate_kl_penalty(
                 kl_multiplier = torch.ones(seq_len)
                 kl_multiplier[reasoning_mask_target] = reasoning_multiplier
         
-        # The advantage is the negative reverse KL. We can optionally apply a discount factor.
+        # The advantage is the negative KL approximation. We can optionally apply a discount factor.
         # Apply the multiplier to the KL penalty coefficient for reasoning tokens
-        kl_advantages = -kl_penalty_coef * float_masks[i] * reverse_kl[i] * kl_multiplier
+        kl_advantages = -kl_penalty_coef * float_masks[i] * kl_approx[i] * kl_multiplier
         if kl_discount_factor > 0:
             kl_advantages = torch.tensor(
                 discounted_future_sum_vectorized(kl_advantages.numpy(), kl_discount_factor)
@@ -384,7 +404,7 @@ async def incorporate_kl_penalty(
 
         # Split KL into thinking vs response for logging
         dataset_idx = dataset_indices_D[i]
-        masked_kl = reverse_kl[i] * float_masks[i]
+        masked_kl = kl_approx[i] * float_masks[i]
         if reasoning_mask_target is not None:
             thinking_kl = (masked_kl * reasoning_mask_target.float()).sum().item()
             thinking_mask = (float_masks[i] * reasoning_mask_target.float()).sum().item()
@@ -451,6 +471,7 @@ class Config:
 
     kl_penalty_coef: float = 1.0
     kl_discount_factor: float = 0.0
+    kl_type: Literal["reverse_kl", "jsd"] = "reverse_kl"
     reasoning_kl_multiplier: float = 1.0
     format_penalty: float = 0.0
     format_violation_threshold: float = 0.5
@@ -499,6 +520,7 @@ async def prepare_minibatch(
     teacher_system_prompt: str | None = None,
     thinking_penalty_threshold: int = 0,
     thinking_penalty_per_token: float = 0.0,
+    kl_type: str = "reverse_kl",
 ) -> tuple[list[tinker.Datum], dict[str, Any], int]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
@@ -546,6 +568,7 @@ async def prepare_minibatch(
                 teacher_system_prompt=teacher_system_prompt,
                 thinking_penalty_threshold=thinking_penalty_threshold,
                 thinking_penalty_per_token=thinking_penalty_per_token,
+                kl_type=kl_type,
             )
         metrics.update(kl_penalty_metrics)
 
@@ -582,6 +605,7 @@ async def do_train_step_and_get_sampling_client(
         teacher_system_prompt=cfg.teacher_system_prompt,
         thinking_penalty_threshold=cfg.thinking_penalty_threshold,
         thinking_penalty_per_token=cfg.thinking_penalty_per_token,
+        kl_type=cfg.kl_type,
     )
     metrics.update(prepare_minibatch_metrics)
 
