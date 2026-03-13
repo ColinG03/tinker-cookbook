@@ -47,41 +47,6 @@ from tinker_cookbook.utils.trace import scope, update_scope_context, trace_init
 logger = logging.getLogger(__name__)
 
 
-def check_think_tag_format(
-    model_input: tinker.ModelInput,
-    tokenizer: Tokenizer,
-) -> bool:
-    """
-    Check whether think tags in the token sequence are well-formed.
-    Returns True when every <think> has a matching </think> (and at least one
-    pair exists). Returns False when tags are missing entirely or unbalanced.
-    """
-    tokens = model_input.to_ints()
-    think_start_tokens = tokenizer.encode("<think>", add_special_tokens=False)
-    think_end_tokens = tokenizer.encode("</think>", add_special_tokens=False)
-
-    n_open = 0
-    n_close = 0
-    i = 0
-    while i < len(tokens):
-        if (
-            i + len(think_start_tokens) <= len(tokens)
-            and tokens[i : i + len(think_start_tokens)] == think_start_tokens
-        ):
-            n_open += 1
-            i += len(think_start_tokens)
-        elif (
-            i + len(think_end_tokens) <= len(tokens)
-            and tokens[i : i + len(think_end_tokens)] == think_end_tokens
-        ):
-            n_close += 1
-            i += len(think_end_tokens)
-        else:
-            i += 1
-
-    return n_open > 0 and n_open == n_close
-
-
 def identify_reasoning_tokens(
     model_input: tinker.ModelInput,
     tokenizer: Tokenizer,
@@ -201,10 +166,7 @@ async def incorporate_kl_penalty(
     reasoning_kl_multiplier: float,
     tokenizer: Tokenizer,
     sample_start_index: int = 0,
-    format_penalty: float = 0.0,
     teacher_system_prompt: str | None = None,
-    thinking_penalty_threshold: int = 0,
-    thinking_penalty_per_token: float = 0.0,
     kl_type: str = "reverse_kl",
 ) -> Dict[str, float]:
     """
@@ -220,10 +182,6 @@ async def incorporate_kl_penalty(
     Reasoning tokens (from <think> through </think>, inclusive of the tags) have their
     KL penalty scaled by reasoning_kl_multiplier (1.0 = full penalty, 0.0 = no penalty).
 
-    When thinking_penalty_threshold > 0 and thinking_penalty_per_token > 0, a flat penalty
-    is applied to advantage positions corresponding to thinking tokens whenever the total
-    thinking token count exceeds the threshold.
-
     When teacher_system_prompt is provided, the teacher sees a modified sequence with
     the system prompt replaced, while all student-side data remains unchanged.
 
@@ -236,10 +194,7 @@ async def incorporate_kl_penalty(
         reasoning_kl_multiplier: Multiplier for KL penalty on think tokens (1.0 = no reduction)
         tokenizer: Tokenizer to identify reasoning tokens
         sample_start_index: Starting index for sample counting
-        format_penalty: Penalty applied to advantages when think tags are malformed/missing
         teacher_system_prompt: If set, replace the system prompt in the teacher's input
-        thinking_penalty_threshold: Token count above which the length penalty kicks in
-        thinking_penalty_per_token: Per-token penalty magnitude for excess thinking tokens
         kl_type: Which divergence to use — "reverse_kl" (default) or "jsd"
     """
     full_sequence_inputs_D = [
@@ -297,11 +252,6 @@ async def incorporate_kl_penalty(
     # Track per-dataset KL for logging, split by thinking vs response
     # dataset_idx -> (thinking_kl_sum, thinking_mask_sum, response_kl_sum, response_mask_sum)
     per_dataset_kl: Dict[int, tuple[float, float, float, float]] = {}
-    format_violation_count = 0.0
-    format_total_count = 0.0
-    total_thinking_tokens_count = 0.0
-    total_thinking_length_penalty = 0.0
-    total_datum_count = 0.0
 
     for i, datum in enumerate(data_D):
         sample_index = sample_start_index + i
@@ -373,35 +323,6 @@ async def incorporate_kl_penalty(
             datum.loss_fn_inputs["advantages"].to_torch() + kl_advantages
         )
 
-        # Format penalty: penalize malformed/missing think tags
-        if format_penalty > 0:
-            tags_ok = check_think_tag_format(full_sequence_inputs_D[i], tokenizer)
-            if not tags_ok:
-                format_advantages = -format_penalty * float_masks[i]
-                datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
-                    datum.loss_fn_inputs["advantages"].to_torch() + format_advantages
-                )
-                format_violation_count += 1.0
-            format_total_count += 1.0
-
-        # Thinking length penalty: discourage excessively long reasoning
-        thinking_token_count = int(reasoning_mask_target.sum().item()) if reasoning_mask_target is not None else 0
-        total_thinking_tokens_count += thinking_token_count
-        total_datum_count += 1.0
-
-        if (
-            thinking_penalty_per_token > 0
-            and thinking_penalty_threshold > 0
-            and reasoning_mask_target is not None
-            and thinking_token_count > thinking_penalty_threshold
-        ):
-            excess = thinking_token_count - thinking_penalty_threshold
-            penalty = excess * thinking_penalty_per_token
-            total_thinking_length_penalty += penalty
-            advantages = datum.loss_fn_inputs["advantages"].to_torch()
-            advantages[reasoning_mask_target] -= penalty
-            datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(advantages)
-
         # Split KL into thinking vs response for logging
         dataset_idx = dataset_indices_D[i]
         masked_kl = kl_approx[i] * float_masks[i]
@@ -448,13 +369,6 @@ async def incorporate_kl_penalty(
         if r_m > 0:
             metrics[f"teacher_kl/dataset_{dataset_idx}/response"] = r_kl / r_m
 
-    if format_total_count > 0:
-        metrics["think_tag_violation_rate"] = format_violation_count / format_total_count
-
-    if total_datum_count > 0:
-        metrics["thinking_tokens_per_turn"] = total_thinking_tokens_count / total_datum_count
-        metrics["thinking_length_penalty"] = total_thinking_length_penalty / total_datum_count
-
     return metrics
 
 
@@ -474,13 +388,6 @@ class Config:
     kl_discount_factor: float = 0.0
     kl_type: Literal["reverse_kl", "jsd"] = "reverse_kl"
     reasoning_kl_multiplier: float = 1.0
-    format_penalty: float = 0.0
-    format_violation_threshold: float = 0.5
-    format_violation_patience: int = 3
-
-    thinking_penalty_threshold: int = 0
-    thinking_penalty_per_token: float = 0.0
-
     # If set, teacher logprobs use this system prompt instead of the student's
     teacher_system_prompt: str | None = None
 
@@ -520,10 +427,7 @@ async def prepare_minibatch(
     kl_discount_factor: float,
     reasoning_kl_multiplier: float,
     sample_start_index: int = 0,
-    format_penalty: float = 0.0,
     teacher_system_prompt: str | None = None,
-    thinking_penalty_threshold: int = 0,
-    thinking_penalty_per_token: float = 0.0,
     kl_type: str = "reverse_kl",
 ) -> tuple[list[tinker.Datum], dict[str, Any], int]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
@@ -568,10 +472,7 @@ async def prepare_minibatch(
                 reasoning_kl_multiplier,
                 tokenizer,
                 sample_start_index,
-                format_penalty=format_penalty,
                 teacher_system_prompt=teacher_system_prompt,
-                thinking_penalty_threshold=thinking_penalty_threshold,
-                thinking_penalty_per_token=thinking_penalty_per_token,
                 kl_type=kl_type,
             )
         metrics.update(kl_penalty_metrics)
@@ -605,10 +506,7 @@ async def do_train_step_and_get_sampling_client(
         kl_discount_factor=cfg.kl_discount_factor,
         reasoning_kl_multiplier=cfg.reasoning_kl_multiplier,
         sample_start_index=sample_start_index,
-        format_penalty=cfg.format_penalty,
         teacher_system_prompt=cfg.teacher_system_prompt,
-        thinking_penalty_threshold=cfg.thinking_penalty_threshold,
-        thinking_penalty_per_token=cfg.thinking_penalty_per_token,
         kl_type=cfg.kl_type,
     )
     metrics.update(prepare_minibatch_metrics)
@@ -662,7 +560,6 @@ async def do_sync_training(
 
     # Track total number of samples processed across all batches
     total_samples_processed = 0
-    consecutive_violations = 0
 
     for i_batch in range(start_batch, end_batch):
         metrics = {
@@ -722,24 +619,6 @@ async def do_sync_training(
         metrics.update(train_step_metrics)
         metrics["time/total"] = time.time() - t_start
         ml_logger.log_metrics(metrics, step=i_batch)
-
-        # Early stopping on sustained think-tag violations
-        if cfg.format_violation_threshold < 1.0:
-            violation_rate = metrics.get("think_tag_violation_rate", 0.0)
-            if violation_rate > cfg.format_violation_threshold:
-                consecutive_violations += 1
-                logger.warning(
-                    f"think_tag_violation_rate={violation_rate:.2f} > {cfg.format_violation_threshold} "
-                    f"({consecutive_violations}/{cfg.format_violation_patience})"
-                )
-                if consecutive_violations >= cfg.format_violation_patience:
-                    logger.error(
-                        f"Early stopping: violation rate exceeded threshold for "
-                        f"{consecutive_violations} consecutive batches"
-                    )
-                    break
-            else:
-                consecutive_violations = 0
 
 
 @scope
