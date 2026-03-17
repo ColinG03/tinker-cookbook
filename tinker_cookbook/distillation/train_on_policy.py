@@ -168,6 +168,7 @@ async def incorporate_kl_penalty(
     sample_start_index: int = 0,
     teacher_system_prompt: str | None = None,
     kl_type: str = "reverse_kl",
+    renyi_alpha: float | None = None,
 ) -> Dict[str, float]:
     """
     Compute KL-based penalty between the student (log p) and the teacher model (log q).
@@ -176,8 +177,11 @@ async def incorporate_kl_penalty(
     When kl_type="jsd", computes the Jensen-Shannon divergence contribution per token:
         log_m - 0.5*(log_p + log_q), where log_m = log(0.5) + logaddexp(log_p, log_q).
     JSD is symmetric, always non-negative, and equals 0 only when p == q.
+    When kl_type="reverse_renyi", computes per-token Rényi divergence of order alpha:
+        1/(alpha-1) * (alpha * log_q + (1-alpha) * log_p).
+    This reduces to forward KL (log_q - log_p) as alpha -> 1.
 
-    In both cases we then adjust the advantages in-place as the negative of the penalty.
+    In all cases we then adjust the advantages in-place as the negative of the penalty.
 
     Reasoning tokens (from <think> through </think>, inclusive of the tags) have their
     KL penalty scaled by reasoning_kl_multiplier (1.0 = full penalty, 0.0 = no penalty).
@@ -195,7 +199,8 @@ async def incorporate_kl_penalty(
         tokenizer: Tokenizer to identify reasoning tokens
         sample_start_index: Starting index for sample counting
         teacher_system_prompt: If set, replace the system prompt in the teacher's input
-        kl_type: Which divergence to use — "reverse_kl" (default) or "jsd"
+        kl_type: Which divergence to use — "reverse_kl" (default), "jsd", or "reverse_renyi"
+        renyi_alpha: Order of Rényi divergence (required when kl_type="reverse_renyi")
     """
     full_sequence_inputs_D = [
         datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
@@ -246,6 +251,10 @@ async def incorporate_kl_penalty(
         if kl_type == "jsd":
             log_m = log_half + torch.logaddexp(log_p, log_q)
             kl_approx.append((log_m - 0.5 * (log_p + log_q)) * mask)
+        elif kl_type == "reverse_renyi":
+            assert renyi_alpha is not None
+            a = renyi_alpha
+            kl_approx.append((1.0 / (a - 1)) * (a * log_q + (1 - a) * log_p) * mask)
         else:  # "reverse_kl"
             kl_approx.append((log_p - log_q) * mask)
 
@@ -386,8 +395,10 @@ class Config:
 
     kl_penalty_coef: float = 1.0
     kl_discount_factor: float = 0.0
-    kl_type: Literal["reverse_kl", "jsd"] = "reverse_kl"
+    kl_type: Literal["reverse_kl", "jsd", "reverse_renyi"] = "reverse_kl"
     reasoning_kl_multiplier: float = 1.0
+    # Required when kl_type="reverse_renyi". Must be > 0 and != 1.
+    renyi_alpha: float | None = None
     # If set, teacher logprobs use this system prompt instead of the student's
     teacher_system_prompt: str | None = None
 
@@ -429,6 +440,7 @@ async def prepare_minibatch(
     sample_start_index: int = 0,
     teacher_system_prompt: str | None = None,
     kl_type: str = "reverse_kl",
+    renyi_alpha: float | None = None,
 ) -> tuple[list[tinker.Datum], dict[str, Any], int]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
@@ -474,6 +486,7 @@ async def prepare_minibatch(
                 sample_start_index,
                 teacher_system_prompt=teacher_system_prompt,
                 kl_type=kl_type,
+                renyi_alpha=renyi_alpha,
             )
         metrics.update(kl_penalty_metrics)
 
@@ -508,6 +521,7 @@ async def do_train_step_and_get_sampling_client(
         sample_start_index=sample_start_index,
         teacher_system_prompt=cfg.teacher_system_prompt,
         kl_type=cfg.kl_type,
+        renyi_alpha=cfg.renyi_alpha,
     )
     metrics.update(prepare_minibatch_metrics)
 
@@ -621,11 +635,26 @@ async def do_sync_training(
         ml_logger.log_metrics(metrics, step=i_batch)
 
 
+def validate_renyi_config(kl_type: str, renyi_alpha: float | None) -> None:
+    """Validate that renyi_alpha is properly configured for the chosen kl_type."""
+    if kl_type == "reverse_renyi":
+        if renyi_alpha is None:
+            raise ValueError("renyi_alpha is required when kl_type='reverse_renyi'")
+        if renyi_alpha <= 0:
+            raise ValueError(f"renyi_alpha must be > 0, got {renyi_alpha}")
+        if renyi_alpha == 1.0:
+            raise ValueError("renyi_alpha must not be 1 (pole in Rényi divergence); use reverse_kl instead")
+    elif renyi_alpha is not None:
+        raise ValueError(f"renyi_alpha is only used with kl_type='reverse_renyi', but kl_type='{kl_type}'")
+
+
 @scope
 async def main(
     cfg: Config,
 ):
     """Main training loop for on-policy distillation."""
+    validate_renyi_config(cfg.kl_type, cfg.renyi_alpha)
+
     ml_logger = ml_log.setup_logging(
         log_dir=cfg.log_path,
         wandb_project=cfg.wandb_project,

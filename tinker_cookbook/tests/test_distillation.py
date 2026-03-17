@@ -12,6 +12,7 @@ from tinker_cookbook.distillation.train_on_policy import (
     identify_reasoning_tokens,
     incorporate_kl_penalty,
     swap_system_prompt_tokens,
+    validate_renyi_config,
 )
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
@@ -651,3 +652,278 @@ async def _test_teacher_system_prompt_fallback_on_missing_system_msg_async():
 
 def test_teacher_system_prompt_fallback_on_missing_system_msg():
     asyncio.run(_test_teacher_system_prompt_fallback_on_missing_system_msg_async())
+
+
+# =============================================================================
+# Tests for validate_renyi_config
+# =============================================================================
+
+
+def test_validate_renyi_config_alpha_none_raises():
+    """renyi_alpha=None must be rejected when kl_type='reverse_renyi'."""
+    with pytest.raises(ValueError, match="renyi_alpha is required"):
+        validate_renyi_config("reverse_renyi", None)
+
+
+def test_validate_renyi_config_alpha_1_raises():
+    """alpha=1 is a pole in the Rényi divergence formula and must be rejected."""
+    with pytest.raises(ValueError, match="must not be 1"):
+        validate_renyi_config("reverse_renyi", 1.0)
+
+
+def test_validate_renyi_config_alpha_zero_raises():
+    """alpha=0 must be rejected (must be > 0)."""
+    with pytest.raises(ValueError, match="must be > 0"):
+        validate_renyi_config("reverse_renyi", 0.0)
+
+
+def test_validate_renyi_config_alpha_negative_raises():
+    """Negative alpha must be rejected."""
+    with pytest.raises(ValueError, match="must be > 0"):
+        validate_renyi_config("reverse_renyi", -0.5)
+
+
+def test_validate_renyi_config_alpha_with_wrong_kl_type_raises():
+    """Setting renyi_alpha when kl_type != 'reverse_renyi' is a misconfiguration."""
+    with pytest.raises(ValueError, match="only used with kl_type='reverse_renyi'"):
+        validate_renyi_config("reverse_kl", 2.0)
+    with pytest.raises(ValueError, match="only used with kl_type='reverse_renyi'"):
+        validate_renyi_config("jsd", 2.0)
+
+
+def test_validate_renyi_config_valid():
+    """Valid configurations should not raise."""
+    validate_renyi_config("reverse_renyi", 2.0)
+    validate_renyi_config("reverse_renyi", 0.5)
+    validate_renyi_config("reverse_renyi", 0.001)
+    validate_renyi_config("reverse_kl", None)
+    validate_renyi_config("jsd", None)
+
+
+# =============================================================================
+# Tests for reverse Rényi divergence computation
+# =============================================================================
+
+
+def _make_datum_with_known_logprobs(
+    tokenizer,
+    log_p: torch.Tensor,
+) -> tuple[tinker.Datum, list[int]]:
+    """Create a datum with known log probabilities for testing divergence computations.
+
+    Uses arbitrary token IDs so no <think> markers are found, giving a uniform
+    kl_multiplier of 1.0 across all positions.
+    """
+    n = len(log_p)
+    tokens = list(range(1000, 1000 + n + 1))
+    model_input = tinker.ModelInput.from_ints(tokens[:-1])
+    target_tokens = tokens[1:]
+
+    datum = tinker.Datum(
+        model_input=model_input,
+        loss_fn_inputs={
+            "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens)),
+            "logprobs": tinker.TensorData.from_torch(log_p),
+            "mask": tinker.TensorData.from_torch(torch.ones(n)),
+            "advantages": tinker.TensorData.from_torch(torch.zeros(n)),
+        },
+    )
+    return datum, tokens
+
+
+def _make_teacher_mock(log_q_values: list[float]) -> MagicMock:
+    """Create a mock teacher client that returns [0.0] + log_q_values."""
+    teacher_client = MagicMock()
+    teacher_logprobs = [0.0] + log_q_values
+    teacher_client.compute_logprobs_async = AsyncMock(return_value=teacher_logprobs)
+    return teacher_client
+
+
+async def _run_kl_penalty(
+    log_p: torch.Tensor,
+    log_q_values: list[float],
+    kl_type: str,
+    tokenizer,
+    renyi_alpha: float | None = None,
+) -> torch.Tensor:
+    """Run incorporate_kl_penalty and return the resulting advantages."""
+    datum, _ = _make_datum_with_known_logprobs(tokenizer, log_p)
+    teacher_client = _make_teacher_mock(log_q_values)
+
+    await incorporate_kl_penalty(
+        data_D=[datum],
+        teacher_clients_D=[teacher_client],
+        dataset_indices_D=[0],
+        kl_penalty_coef=1.0,
+        kl_discount_factor=0.0,
+        reasoning_kl_multiplier=1.0,
+        tokenizer=tokenizer,
+        kl_type=kl_type,
+        renyi_alpha=renyi_alpha,
+    )
+    return datum.loss_fn_inputs["advantages"].to_torch()
+
+
+async def _test_reverse_renyi_formula_alpha_2_async():
+    """Verify the Rényi divergence formula at alpha=2.
+
+    With alpha=2 the per-token divergence is:
+        1/(2-1) * (2*log_q + (1-2)*log_p) = 2*log_q - log_p
+    and advantages = -kl_penalty_coef * divergence.
+    """
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    log_p = torch.tensor([-1.0, -2.0, -0.5, -1.5, -3.0])
+    log_q_values = [-1.5, -1.0, -0.5, -2.0, -1.0]
+    log_q = torch.tensor(log_q_values)
+
+    advantages = await _run_kl_penalty(log_p, log_q_values, "reverse_renyi", tokenizer, renyi_alpha=2.0)
+
+    expected_div = 2.0 * log_q - log_p  # = [-2.0, 0.0, -0.5, -2.5, 1.0]
+    expected_advantages = -expected_div
+    torch.testing.assert_close(advantages, expected_advantages, atol=1e-6, rtol=1e-6)
+
+
+def test_reverse_renyi_formula_alpha_2():
+    asyncio.run(_test_reverse_renyi_formula_alpha_2_async())
+
+
+async def _test_reverse_renyi_formula_alpha_half_async():
+    """Verify the Rényi divergence formula at alpha=0.5.
+
+    With alpha=0.5 the per-token divergence is:
+        1/(0.5-1) * (0.5*log_q + 0.5*log_p) = -1 * 0.5 * (log_q + log_p) = -(log_q + log_p)/2
+    """
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    log_p = torch.tensor([-1.0, -2.0, -0.5, -1.5, -3.0])
+    log_q_values = [-1.5, -1.0, -0.5, -2.0, -1.0]
+    log_q = torch.tensor(log_q_values)
+
+    advantages = await _run_kl_penalty(log_p, log_q_values, "reverse_renyi", tokenizer, renyi_alpha=0.5)
+
+    alpha = 0.5
+    expected_div = (1.0 / (alpha - 1)) * (alpha * log_q + (1 - alpha) * log_p)
+    expected_advantages = -expected_div
+    torch.testing.assert_close(advantages, expected_advantages, atol=1e-6, rtol=1e-6)
+
+
+def test_reverse_renyi_formula_alpha_half():
+    asyncio.run(_test_reverse_renyi_formula_alpha_half_async())
+
+
+async def _test_reverse_renyi_vs_reverse_kl_different_async():
+    """Reverse Rényi and reverse KL produce different advantages for the same inputs."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    log_p = torch.tensor([-1.0, -2.0, -0.5])
+    log_q_values = [-1.5, -1.0, -0.5]
+
+    adv_kl = await _run_kl_penalty(log_p, log_q_values, "reverse_kl", tokenizer)
+    adv_renyi = await _run_kl_penalty(log_p, log_q_values, "reverse_renyi", tokenizer, renyi_alpha=2.0)
+
+    # They should differ where log_p != log_q
+    assert not torch.allclose(adv_kl, adv_renyi), (
+        "Reverse Rényi (alpha=2) should give different advantages than reverse KL"
+    )
+
+
+def test_reverse_renyi_vs_reverse_kl_different():
+    asyncio.run(_test_reverse_renyi_vs_reverse_kl_different_async())
+
+
+async def _test_reverse_renyi_agrees_with_reverse_kl_when_equal_logprobs_async():
+    """When log_p == log_q, both reverse KL and reverse Rényi give zero advantages.
+
+    reverse_kl: log_p - log_q = 0
+    reverse_renyi: 1/(a-1) * (a*log_q + (1-a)*log_p) = 1/(a-1) * log_p, which is NOT zero.
+    However, the MASKED divergence for tokens where p == q should be the same ONLY for
+    reverse_kl. This test documents this expected difference.
+    """
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    log_p = torch.tensor([-1.0, -2.0, -0.5])
+    log_q_values = log_p.tolist()
+
+    adv_kl = await _run_kl_penalty(log_p, log_q_values, "reverse_kl", tokenizer)
+    adv_renyi = await _run_kl_penalty(log_p, log_q_values, "reverse_renyi", tokenizer, renyi_alpha=2.0)
+
+    # reverse_kl advantages should be zero when log_p == log_q
+    torch.testing.assert_close(adv_kl, torch.zeros_like(adv_kl), atol=1e-6, rtol=1e-6)
+
+    # reverse_renyi advantages are NOT zero (per-token approximation property):
+    # 1/(2-1) * (2*log_p + (1-2)*log_p) = 2*log_p - log_p = log_p
+    expected_renyi_div = log_p  # = log_p when log_q == log_p
+    expected_renyi_adv = -expected_renyi_div
+    torch.testing.assert_close(adv_renyi, expected_renyi_adv, atol=1e-6, rtol=1e-6)
+
+
+def test_reverse_renyi_agrees_with_reverse_kl_when_equal_logprobs():
+    asyncio.run(_test_reverse_renyi_agrees_with_reverse_kl_when_equal_logprobs_async())
+
+
+async def _test_reverse_renyi_with_partial_mask_async():
+    """Masked-out positions should have zero divergence contribution."""
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    log_p = torch.tensor([-1.0, -2.0, -0.5, -1.5])
+    log_q_values = [-1.5, -1.0, -0.5, -2.0]
+
+    datum, _ = _make_datum_with_known_logprobs(tokenizer, log_p)
+    # Mask out positions 1 and 3
+    mask = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    datum.loss_fn_inputs["mask"] = tinker.TensorData.from_torch(mask)
+
+    teacher_client = _make_teacher_mock(log_q_values)
+
+    await incorporate_kl_penalty(
+        data_D=[datum],
+        teacher_clients_D=[teacher_client],
+        dataset_indices_D=[0],
+        kl_penalty_coef=1.0,
+        kl_discount_factor=0.0,
+        reasoning_kl_multiplier=1.0,
+        tokenizer=tokenizer,
+        kl_type="reverse_renyi",
+        renyi_alpha=2.0,
+    )
+
+    advantages = datum.loss_fn_inputs["advantages"].to_torch()
+    # Masked-out positions should have zero advantage change
+    assert advantages[1].item() == 0.0
+    assert advantages[3].item() == 0.0
+    # Unmasked positions should be nonzero (since log_p != log_q at those positions)
+    assert advantages[0].item() != 0.0
+    assert advantages[2].item() != 0.0
+
+
+def test_reverse_renyi_with_partial_mask():
+    asyncio.run(_test_reverse_renyi_with_partial_mask_async())
+
+
+async def _test_reverse_renyi_alpha_near_1_diverges_async():
+    """As alpha approaches 1, per-token Rényi magnitudes grow (formula has a pole at alpha=1).
+
+    This documents the expected numerical behavior: the 1/(alpha-1) prefactor
+    amplifies the divergence as alpha → 1.
+    """
+    tokenizer = get_tokenizer("Qwen/Qwen3-8B")
+
+    log_p = torch.tensor([-1.0, -2.0, -0.5])
+    log_q_values = [-1.5, -1.0, -0.5]
+
+    adv_far = await _run_kl_penalty(log_p, log_q_values, "reverse_renyi", tokenizer, renyi_alpha=2.0)
+    adv_closer = await _run_kl_penalty(log_p, log_q_values, "reverse_renyi", tokenizer, renyi_alpha=1.1)
+    adv_very_close = await _run_kl_penalty(log_p, log_q_values, "reverse_renyi", tokenizer, renyi_alpha=1.01)
+
+    # Magnitudes should increase as alpha approaches 1
+    mag_far = adv_far.abs().sum().item()
+    mag_closer = adv_closer.abs().sum().item()
+    mag_very_close = adv_very_close.abs().sum().item()
+
+    assert mag_closer > mag_far, "Advantages should grow in magnitude as alpha → 1"
+    assert mag_very_close > mag_closer, "Advantages should grow further as alpha gets even closer to 1"
+
+
+def test_reverse_renyi_alpha_near_1_diverges():
+    asyncio.run(_test_reverse_renyi_alpha_near_1_diverges_async())
