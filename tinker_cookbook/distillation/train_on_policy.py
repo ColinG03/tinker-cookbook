@@ -178,8 +178,8 @@ async def incorporate_kl_penalty(
         log_m - 0.5*(log_p + log_q), where log_m = log(0.5) + logaddexp(log_p, log_q).
     JSD is symmetric, always non-negative, and equals 0 only when p == q.
     When kl_type="reverse_renyi", computes per-token Rényi divergence of order alpha:
-        1/(alpha-1) * (alpha * log_q + (1-alpha) * log_p).
-    This reduces to forward KL (log_q - log_p) as alpha -> 1.
+        1/(alpha-1) * (alpha * log_p + (1-alpha) * log_q).
+    This reduces to reverse KL (log_p - log_q) as alpha -> 1.
 
     In all cases we then adjust the advantages in-place as the negative of the penalty.
 
@@ -254,7 +254,7 @@ async def incorporate_kl_penalty(
         elif kl_type == "reverse_renyi":
             assert renyi_alpha is not None
             a = renyi_alpha
-            kl_approx.append((1.0 / (a - 1)) * (a * log_q + (1 - a) * log_p) * mask)
+            kl_approx.append((1.0 / (a - 1)) * (a * log_p + (1 - a) * log_q) * mask)
         else:  # "reverse_kl"
             kl_approx.append((log_p - log_q) * mask)
 
